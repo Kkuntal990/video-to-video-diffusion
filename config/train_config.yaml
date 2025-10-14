@@ -22,6 +22,34 @@ model:
   beta_start: 0.0001
   beta_end: 0.02
 
+# Pretrained Weights Configuration
+pretrained:
+  # Use pretrained weights (set to false to train from scratch)
+  use_pretrained: true
+
+  # VAE pretrained weights
+  vae:
+    enabled: true
+    model_name: 'hpcai-tech/OpenSora-VAE-v1.2'  # or 'THUDM/CogVideoX-5b', 'stabilityai/sd-vae-ft-mse'
+    method: 'auto'  # 'auto', 'opensora', 'cogvideox', 'sd', or 'local'
+    inflate_method: 'central'  # For SD VAE: 'central', 'replicate', or 'average'
+    freeze_epochs: 5  # Freeze VAE for first N epochs (0 to disable)
+
+  # U-Net pretrained weights (future feature)
+  unet:
+    enabled: false
+    model_name: null
+
+  # Training strategy with pretrained weights
+  two_phase_training: true  # Phase 1: freeze VAE, Phase 2: fine-tune all
+  phase1_epochs: 10  # Freeze VAE for first N epochs
+
+  # Layer-wise learning rates (optional)
+  layer_lr_multipliers:
+    vae_encoder: 0.1  # 10% of base LR
+    vae_decoder: 0.1
+    unet: 1.0  # 100% of base LR
+
 # Data Configuration
 data:
   # Data source (HuggingFace dataset name or local directory)

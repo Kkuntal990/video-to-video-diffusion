@@ -35,15 +35,29 @@ class VideoToVideoDiffusion(nn.Module):
         - Decode: v_out = VAE.decode(z_0)
     """
 
-    def __init__(self, config):
+    def __init__(self, config, load_pretrained=False):
         super().__init__()
 
+        # Check if pretrained weights should be loaded
+        pretrained_config = config.get('pretrained', {})
+        use_pretrained = pretrained_config.get('use_pretrained', False) or load_pretrained
+
         # VAE for encoding/decoding videos
-        self.vae = VideoVAE(
-            in_channels=config.get('in_channels', 3),
-            latent_dim=config.get('latent_dim', 4),
-            base_channels=config.get('vae_base_channels', 64)
-        )
+        if use_pretrained and pretrained_config.get('vae', {}).get('enabled', False):
+            vae_config = pretrained_config['vae']
+            print(f"Loading pretrained VAE from {vae_config['model_name']}...")
+            self.vae = VideoVAE.from_pretrained(
+                vae_config['model_name'],
+                method=vae_config.get('method', 'auto'),
+                inflate_method=vae_config.get('inflate_method', 'central'),
+                device='cpu'  # Will be moved to correct device later
+            )
+        else:
+            self.vae = VideoVAE(
+                in_channels=config.get('in_channels', 3),
+                latent_dim=config.get('latent_dim', 4),
+                base_channels=config.get('vae_base_channels', 64)
+            )
 
         # U-Net for denoising
         self.unet = UNet3D(
@@ -65,6 +79,7 @@ class VideoToVideoDiffusion(nn.Module):
         )
 
         self.config = config
+        self.use_pretrained = use_pretrained
 
     def encode_videos(self, v_in, v_gt=None):
         """

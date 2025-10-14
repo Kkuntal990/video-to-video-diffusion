@@ -244,6 +244,130 @@ class VideoVAE(nn.Module):
         B, C, T, H, W = video_shape
         return (B, self.latent_dim, T, H // 8, W // 8)
 
+    @classmethod
+    def from_pretrained(cls, model_name_or_path, method='auto', inflate_method='central',
+                       strict=True, device='cpu', **kwargs):
+        """
+        Load VideoVAE from pretrained weights
+
+        Supports:
+        - Open-Sora VAE (3D, direct loading)
+        - CogVideoX VAE (3D, direct loading)
+        - Stable Diffusion VAE (2D, inflate to 3D)
+        - HunyuanVideo VAE (3D, direct loading)
+        - Local checkpoint files
+
+        Args:
+            model_name_or_path: HuggingFace model name or local path
+            method: 'auto', 'opensora', 'cogvideox', 'sd', or 'local'
+            inflate_method: For SD VAE, inflation method ('central', 'replicate', 'average')
+            strict: Whether to strictly enforce state dict matching
+            device: Device to load model on
+            **kwargs: Additional arguments for model initialization
+
+        Returns:
+            VideoVAE instance with loaded weights
+
+        Examples:
+            >>> # Load Open-Sora VAE (recommended)
+            >>> vae = VideoVAE.from_pretrained('hpcai-tech/OpenSora-VAE-v1.2')
+
+            >>> # Load CogVideoX VAE
+            >>> vae = VideoVAE.from_pretrained('THUDM/CogVideoX-5b', method='cogvideox')
+
+            >>> # Load and inflate SD VAE
+            >>> vae = VideoVAE.from_pretrained('stabilityai/sd-vae-ft-mse', method='sd')
+
+            >>> # Load from local checkpoint
+            >>> vae = VideoVAE.from_pretrained('./checkpoints/vae.pt', method='local')
+        """
+        from pathlib import Path
+        from ..utils.pretrained import (
+            load_pretrained_opensora_vae,
+            load_pretrained_cogvideox_vae,
+            load_pretrained_sd_vae,
+            map_sd_vae_to_video_vae,
+            load_state_dict_from_file
+        )
+
+        # Auto-detect method
+        if method == 'auto':
+            model_lower = str(model_name_or_path).lower()
+            if 'opensora' in model_lower or 'hpcai' in model_lower:
+                method = 'opensora'
+            elif 'cogvideo' in model_lower or 'thudm' in model_lower:
+                method = 'cogvideox'
+            elif 'sd' in model_lower or 'stable' in model_lower or 'stability' in model_lower:
+                method = 'sd'
+            elif Path(model_name_or_path).exists():
+                method = 'local'
+            else:
+                raise ValueError(f"Cannot auto-detect method for: {model_name_or_path}")
+
+        print(f"Loading VideoVAE using method: {method}")
+
+        # Load state dict based on method
+        if method == 'opensora':
+            state_dict = load_pretrained_opensora_vae(model_name_or_path)
+        elif method == 'cogvideox':
+            state_dict = load_pretrained_cogvideox_vae(model_name_or_path)
+        elif method == 'sd':
+            # Load SD VAE and inflate 2D->3D
+            sd_state_dict = load_pretrained_sd_vae(model_name_or_path)
+            state_dict = map_sd_vae_to_video_vae(sd_state_dict, inflate_method=inflate_method)
+            print(f"Inflated 2D SD VAE to 3D using method: {inflate_method}")
+        elif method == 'local':
+            state_dict = load_state_dict_from_file(model_name_or_path)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        # Create model instance
+        # Try to infer parameters from state dict
+        if 'encoder.conv_in.conv.weight' in state_dict:
+            in_channels = state_dict['encoder.conv_in.conv.weight'].shape[1]
+        else:
+            in_channels = kwargs.get('in_channels', 3)
+
+        if 'encoder.conv_out.weight' in state_dict:
+            latent_dim = state_dict['encoder.conv_out.weight'].shape[0]
+        else:
+            latent_dim = kwargs.get('latent_dim', 4)
+
+        if 'encoder.conv_in.conv.weight' in state_dict:
+            base_channels = state_dict['encoder.conv_in.conv.weight'].shape[0]
+        else:
+            base_channels = kwargs.get('base_channels', 64)
+
+        # Create model
+        model = cls(
+            in_channels=in_channels,
+            latent_dim=latent_dim,
+            base_channels=base_channels
+        )
+
+        # Load weights
+        try:
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
+
+            if missing_keys:
+                print(f"Warning: Missing keys: {missing_keys}")
+            if unexpected_keys:
+                print(f"Warning: Unexpected keys: {unexpected_keys}")
+
+            print(f"✓ Successfully loaded pretrained VAE weights")
+
+        except Exception as e:
+            print(f"Error loading state dict: {e}")
+            if strict:
+                raise
+            print("Trying non-strict loading...")
+            model.load_state_dict(state_dict, strict=False)
+
+        model = model.to(device)
+        model.eval()  # Set to eval mode by default
+
+        return model
+
 
 if __name__ == "__main__":
     # Test the VAE
