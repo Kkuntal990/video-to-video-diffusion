@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model checkpoints and weights
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+pretrained_weights/
+
+# Training logs and outputs
+logs/
+runs/
+tensorboard/
+wandb/
+*.log
+
+# Data
+data/
+datasets/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Results
+results/
+outputs/
+samples/
+generated/
+
+# OS specific
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Test files
+test.py
+test_*.py
+debug.py
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# HuggingFace cache
+.cache/
+huggingface/
+
+# Distribution / packaging
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
