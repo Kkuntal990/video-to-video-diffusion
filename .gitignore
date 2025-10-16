@@ -70,10 +70,11 @@ Thumbs.db
 *.swo
 *~
 
-# Test files (but keep test_ape_data_loading.py)
+# Test files (but keep test scripts)
 test.py
 debug.py
 !test_ape_data_loading.py
+!test_train_ape.py
 
 # Temporary files
 tmp/
