@@ -1,0 +1,84 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v2v-diffusion-training
+  labels:
+    app: v2v-diffusion
+    type: training
+spec:
+  # Number of retries before marking job as failed
+  backoffLimit: 2
+
+  template:
+    metadata:
+      labels:
+        app: v2v-diffusion
+        type: training
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: training
+        image: <YOUR_DOCKER_IMAGE>  # Replace with your Docker image
+        imagePullPolicy: Always
+
+        # Training command
+        command: ["/bin/bash"]
+        args:
+          - "-c"
+          - |
+            echo "Starting training..."
+            echo "GPU Info:"
+            nvidia-smi
+
+            # Copy code to storage if needed
+            # cp -r /workspace /workspace/storage/code
+
+            # Change to storage directory for outputs
+            cd /workspace
+
+            # Run training with cloud config
+            python train.py --config config/cloud_train_config.yaml
+
+            echo "Training completed!"
+
+        resources:
+          requests:
+            memory: "48Gi"
+            cpu: "12"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "64Gi"
+            cpu: "16"
+            nvidia.com/gpu: "1"
+
+        volumeMounts:
+        - name: storage
+          mountPath: /workspace/storage
+        - name: dshm
+          mountPath: /dev/shm
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TORCH_HOME
+          value: "/workspace/storage/.cache/torch"
+        - name: HF_HOME
+          value: "/workspace/storage/.cache/huggingface"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: OMP_NUM_THREADS
+          value: "8"
+
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"  # Shared memory for data loading
+
+      # Node selector for GPU nodes (optional - adjust based on your cluster)
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB  # Adjust or remove based on available GPUs
