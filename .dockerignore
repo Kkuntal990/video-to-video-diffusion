@@ -1,0 +1,51 @@
+# Git files
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Outputs and logs
+outputs/
+checkpoints/
+logs/
+wandb/
+.cache/
+
+# Kubernetes files
+kub_files/
+
+# Dataset cache
+data/
+datasets/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Mac
+.DS_Store
+
+# Testing
+.pytest_cache/

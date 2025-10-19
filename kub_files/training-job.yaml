@@ -19,7 +19,7 @@ spec:
 
       containers:
       - name: training
-        image: <YOUR_DOCKER_IMAGE>  # Replace with your Docker image
+        image: kkokate990/v2v-diffusion:latest  # Replace with your Docker image
         imagePullPolicy: Always
 
         # Training command
