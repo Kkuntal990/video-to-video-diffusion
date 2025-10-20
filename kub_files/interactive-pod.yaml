@@ -10,11 +10,30 @@ spec:
 
   containers:
   - name: training
-    image: kkokate990/v2v-diffusion:latest  # Replace with your Docker image
-    imagePullPolicy: Always
+    image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+    imagePullPolicy: IfNotPresent
 
     command: ["/bin/bash"]
-    args: ["-c", "sleep infinity"]  # Keep container running
+    args:
+      - "-c"
+      - |
+        echo "Installing system dependencies..."
+        apt-get update && apt-get install -y git wget && rm -rf /var/lib/apt/lists/*
+
+        echo "Cloning repository..."
+        cd /workspace
+        if [ ! -d "video-to-video-diffusion" ]; then
+          git clone https://github.com/Kkuntal990/video-to-video-diffusion.git
+        fi
+        cd video-to-video-diffusion
+        git checkout pretrained_main
+        git pull
+
+        echo "Installing Python dependencies..."
+        pip install --no-cache-dir -r requirements.txt
+
+        echo "Setup complete! Keeping container alive..."
+        sleep infinity
 
     resources:
       requests:
