@@ -1,5 +1,5 @@
 # Video-to-Video Diffusion Model Training Docker Image
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 # Set working directory
 WORKDIR /workspace
