@@ -36,8 +36,8 @@ wandb/
 # Kubernetes files
 kub_files/
 
-# Dataset cache
-data/
+# Dataset cache (but keep source code)
+# data/  # Don't ignore - we need the data module source code
 datasets/
 
 # Jupyter
