@@ -19,29 +19,20 @@ spec:
 
       containers:
       - name: training
-        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
-        imagePullPolicy: IfNotPresent
+        image: ghcr.io/kkuntal990/v2v-diffusion:latest
+        imagePullPolicy: Always
 
         # Training command
         command: ["/bin/bash"]
         args:
           - "-c"
           - |
-            echo "Installing system dependencies..."
-            apt-get update && apt-get install -y git wget && rm -rf /var/lib/apt/lists/*
-
-            echo "Cloning repository..."
-            cd /workspace
-            git clone https://github.com/Kkuntal990/video-to-video-diffusion.git
-            cd video-to-video-diffusion
-            git checkout pretrained_main
-
-            echo "Installing Python dependencies..."
-            pip install --no-cache-dir -r requirements.txt
-
             echo "Starting training..."
             echo "GPU Info:"
             nvidia-smi
+
+            # Change to workspace directory
+            cd /workspace
 
             # Run training with cloud config
             python train.py --config config/cloud_train_config.yaml

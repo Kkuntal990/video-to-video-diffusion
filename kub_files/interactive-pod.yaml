@@ -10,39 +10,27 @@ spec:
 
   containers:
   - name: training
-    image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
-    imagePullPolicy: IfNotPresent
+    image: ghcr.io/kkuntal990/v2v-diffusion:latest
+    imagePullPolicy: Always
 
     command: ["/bin/bash"]
     args:
       - "-c"
       - |
-        echo "Installing system dependencies..."
-        apt-get update && apt-get install -y git wget && rm -rf /var/lib/apt/lists/*
-
-        echo "Cloning repository..."
-        cd /workspace
-        if [ ! -d "video-to-video-diffusion" ]; then
-          git clone https://github.com/Kkuntal990/video-to-video-diffusion.git
-        fi
-        cd video-to-video-diffusion
-        git checkout pretrained_main
-        git pull
-
-        echo "Installing Python dependencies..."
-        pip install --no-cache-dir -r requirements.txt
+        echo "Container ready! All dependencies pre-installed."
+        echo "Working directory: /workspace"
 
         echo "Setup complete! Keeping container alive..."
-        sleep infinity
+        sleep 3600
 
     resources:
       requests:
-        memory: "32Gi"
-        cpu: "8"
+        memory: "8Gi"
+        cpu: "2"
         nvidia.com/gpu: "1"
       limits:
-        memory: "64Gi"
-        cpu: "16"
+        memory: "32Gi"
+        cpu: "8"
         nvidia.com/gpu: "1"
 
     volumeMounts:
@@ -68,6 +56,4 @@ spec:
       medium: Memory
       sizeLimit: "8Gi"
 
-  # Node selector for GPU nodes
-  nodeSelector:
-    nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB  # Adjust based on available GPUs
+  # No nodeSelector - will use any available GPU node
