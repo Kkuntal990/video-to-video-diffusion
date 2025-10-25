@@ -34,7 +34,8 @@ class Trainer:
         config=None,
         device='cuda',
         log_dir='logs',
-        checkpoint_dir='checkpoints'
+        checkpoint_dir='checkpoints',
+        pretrained_config=None
     ):
         """
         Args:
@@ -47,6 +48,7 @@ class Trainer:
             device: training device
             log_dir: directory for TensorBoard logs
             checkpoint_dir: directory for checkpoints
+            pretrained_config: pretrained weights config dict
         """
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -55,9 +57,28 @@ class Trainer:
         self.val_dataloader = val_dataloader
         self.device = device
         self.config = config or {}
+        self.pretrained_config = pretrained_config or {}
 
         # Training settings
         self.num_epochs = self.config.get('num_epochs', 100)
+
+        # Two-phase training settings
+        self.use_two_phase = self.pretrained_config.get('two_phase_training', False)
+        self.phase1_epochs = self.pretrained_config.get('phase1_epochs', 1)
+        self.vae_freeze_epochs = self.pretrained_config.get('vae', {}).get('freeze_epochs', 0)
+        self.current_phase = 1 if self.use_two_phase else 0  # 0=no phases, 1=phase1, 2=phase2
+
+        # Log phase information
+        if self.use_two_phase:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Two-phase training enabled:")
+            logger.info(f"  Phase 1: {self.phase1_epochs} epochs (VAE frozen)")
+            logger.info(f"  Phase 2: {self.num_epochs - self.phase1_epochs} epochs (fine-tune all)")
+        elif self.vae_freeze_epochs > 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"VAE will be frozen for first {self.vae_freeze_epochs} epochs")
         self.gradient_accumulation_steps = self.config.get('gradient_accumulation_steps', 1)
         self.use_amp = self.config.get('use_amp', True)
         self.log_interval = self.config.get('log_interval', 10)
@@ -87,6 +108,26 @@ class Trainer:
         print(f"  Mixed precision: {self.use_amp}")
         print(f"  Log dir: {self.log_dir}")
         print(f"  Checkpoint dir: {self.checkpoint_dir}")
+
+    def freeze_vae(self):
+        """Freeze VAE parameters (encoder and decoder)"""
+        for param in self.model.vae.parameters():
+            param.requires_grad = False
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("🔒 VAE frozen (parameters set to requires_grad=False)")
+        print("🔒 VAE frozen")
+
+    def unfreeze_vae(self):
+        """Unfreeze VAE parameters (encoder and decoder)"""
+        for param in self.model.vae.parameters():
+            param.requires_grad = True
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("🔓 VAE unfrozen (parameters set to requires_grad=True)")
+        print("🔓 VAE unfrozen")
 
     def train_epoch(self):
         """Train for one epoch"""
@@ -154,7 +195,11 @@ class Trainer:
                 self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
 
         # Average epoch loss
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        if len(epoch_losses) > 0:
+            avg_loss = sum(epoch_losses) / len(epoch_losses)
+        else:
+            logger.warning("No batches were processed in this epoch!")
+            avg_loss = 0.0
         return avg_loss
 
     @torch.no_grad()
@@ -186,14 +231,43 @@ class Trainer:
         return avg_val_loss
 
     def train(self):
-        """Main training loop"""
+        """Main training loop with two-phase training support"""
         print(f"\nStarting training for {self.num_epochs} epochs...")
-        print(f"Total steps: {len(self.train_dataloader) * self.num_epochs}")
+        try:
+            print(f"Total steps: {len(self.train_dataloader) * self.num_epochs}")
+        except TypeError:
+            print(f"Total steps: Unknown (streaming dataset)")
+
+        # Freeze VAE at start if configured
+        if self.use_two_phase or self.vae_freeze_epochs > 0:
+            self.freeze_vae()
+            if self.use_two_phase:
+                print(f"\n{'='*60}")
+                print(f"PHASE 1: Training U-Net only (VAE frozen)")
+                print(f"Duration: {self.phase1_epochs} epoch(s)")
+                print(f"{'='*60}\n")
 
         start_time = time.time()
 
         for epoch in range(self.num_epochs):
             self.current_epoch = epoch
+
+            # Check for phase transition (two-phase training)
+            if self.use_two_phase and self.current_phase == 1 and epoch >= self.phase1_epochs:
+                # Transition to Phase 2
+                self.current_phase = 2
+                self.unfreeze_vae()
+                print(f"\n{'='*60}")
+                print(f"PHASE 2: Fine-tuning entire model (VAE unfrozen)")
+                print(f"Duration: {self.num_epochs - self.phase1_epochs} epoch(s)")
+                print(f"{'='*60}\n")
+
+            # Check for simple freeze mode (not two-phase)
+            elif not self.use_two_phase and self.vae_freeze_epochs > 0 and epoch == self.vae_freeze_epochs:
+                self.unfreeze_vae()
+                print(f"\n{'='*60}")
+                print(f"VAE unfrozen after {self.vae_freeze_epochs} epoch(s)")
+                print(f"{'='*60}\n")
 
             # Train epoch
             avg_loss = self.train_epoch()

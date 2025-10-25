@@ -166,9 +166,11 @@ class TemporalAttention(nn.Module):
 class Downsample3D(nn.Module):
     """Downsample spatial dimensions by 2"""
 
-    def __init__(self, channels):
+    def __init__(self, in_channels, out_channels=None):
         super().__init__()
-        self.conv = nn.Conv3d(channels, channels,
+        if out_channels is None:
+            out_channels = in_channels
+        self.conv = nn.Conv3d(in_channels, out_channels,
                              kernel_size=(3, 4, 4),
                              stride=(1, 2, 2),
                              padding=(1, 1, 1))
@@ -230,6 +232,8 @@ class UNet3D(nn.Module):
         for level, mult in enumerate(channel_mult):
             out_ch = model_channels * mult
 
+            # Group all blocks for this level
+            level_blocks = nn.ModuleList()
             for _ in range(num_res_blocks):
                 layers = [ResBlock3D(ch, out_ch, time_embed_dim)]
 
@@ -237,12 +241,14 @@ class UNet3D(nn.Module):
                 if level in attention_levels:
                     layers.append(TemporalAttention(out_ch, num_heads))
 
-                self.down_blocks.append(nn.ModuleList(layers))
+                level_blocks.append(nn.ModuleList(layers))
                 ch = out_ch
 
-            # Downsample (except last level)
+            self.down_blocks.append(level_blocks)
+
+            # Downsample (except last level) - keeps same channels
             if level < self.num_levels - 1:
-                self.down_samples.append(Downsample3D(ch))
+                self.down_samples.append(Downsample3D(ch, ch))
             else:
                 self.down_samples.append(nn.Identity())
 
@@ -258,9 +264,14 @@ class UNet3D(nn.Module):
         for level, mult in enumerate(reversed(channel_mult)):
             out_ch = model_channels * mult
 
+            # Group all blocks for this level
+            level_blocks = nn.ModuleList()
             for i in range(num_res_blocks + 1):
-                # Skip connection doubles the input channels
-                in_ch = ch + (model_channels * channel_mult[self.num_levels - 1 - level])
+                # First block in level gets concatenated skip connection
+                if i == 0:
+                    in_ch = ch + (model_channels * channel_mult[self.num_levels - 1 - level])
+                else:
+                    in_ch = ch
 
                 layers = [ResBlock3D(in_ch, out_ch, time_embed_dim)]
 
@@ -268,8 +279,10 @@ class UNet3D(nn.Module):
                 if (self.num_levels - 1 - level) in attention_levels:
                     layers.append(TemporalAttention(out_ch, num_heads))
 
-                self.up_blocks.append(nn.ModuleList(layers))
+                level_blocks.append(nn.ModuleList(layers))
                 ch = out_ch
+
+            self.up_blocks.append(level_blocks)
 
             # Upsample (except last level)
             if level < self.num_levels - 1:
@@ -304,12 +317,14 @@ class UNet3D(nn.Module):
 
         # Encoder
         skip_connections = []
-        for i, (block_list, downsample) in enumerate(zip(self.down_blocks, self.down_samples)):
-            for layer in block_list:
-                if isinstance(layer, ResBlock3D):
-                    x = layer(x, time_emb)
-                else:  # TemporalAttention
-                    x = layer(x)
+        for i, (level_blocks, downsample) in enumerate(zip(self.down_blocks, self.down_samples)):
+            # Process all blocks at this level
+            for block_list in level_blocks:
+                for layer in block_list:
+                    if isinstance(layer, ResBlock3D):
+                        x = layer(x, time_emb)
+                    else:  # TemporalAttention
+                        x = layer(x)
 
             skip_connections.append(x)
             x = downsample(x)
@@ -320,16 +335,19 @@ class UNet3D(nn.Module):
         x = self.mid_block2(x, time_emb)
 
         # Decoder
-        for i, (block_list, upsample) in enumerate(zip(self.up_blocks, self.up_samples)):
-            # Get skip connection
-            skip = skip_connections.pop()
-            x = torch.cat([x, skip], dim=1)
+        for i, (level_blocks, upsample) in enumerate(zip(self.up_blocks, self.up_samples)):
+            # Process all blocks at this level
+            for j, block_list in enumerate(level_blocks):
+                # Concatenate skip connection only before first block of the level
+                if j == 0:
+                    skip = skip_connections.pop()
+                    x = torch.cat([x, skip], dim=1)
 
-            for layer in block_list:
-                if isinstance(layer, ResBlock3D):
-                    x = layer(x, time_emb)
-                else:  # TemporalAttention
-                    x = layer(x)
+                for layer in block_list:
+                    if isinstance(layer, ResBlock3D):
+                        x = layer(x, time_emb)
+                    else:  # TemporalAttention
+                        x = layer(x)
 
             x = upsample(x)
 

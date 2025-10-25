@@ -39,6 +39,13 @@ except ImportError:
     HF_DATASETS_AVAILABLE = False
     print("Warning: datasets library not installed. Install with: pip install datasets")
 
+try:
+    from huggingface_hub import hf_hub_download, list_repo_files
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
+    print("Warning: huggingface_hub not installed. Install with: pip install huggingface_hub")
+
 from .transforms import VideoTransform
 
 
@@ -69,6 +76,7 @@ class APEHuggingFaceDataset(IterableDataset):
         window_width: int = 400,
         streaming: bool = True,
         cache_dir: Optional[str] = None,
+        max_samples: Optional[int] = None,
     ):
         """
         Args:
@@ -102,6 +110,7 @@ class APEHuggingFaceDataset(IterableDataset):
         self.window_width = window_width
         self.streaming = streaming
         self.cache_dir = cache_dir
+        self.max_samples = max_samples
 
         # Default transform
         if transform is None:
@@ -116,14 +125,26 @@ class APEHuggingFaceDataset(IterableDataset):
         print(f"Categories: {self.categories}")
 
         try:
-            self.hf_dataset = load_dataset(
-                dataset_name,
-                split=split,
-                streaming=streaming,
-                cache_dir=cache_dir,
-                trust_remote_code=True  # May be needed for custom dataset scripts
-            )
-            print(f"✓ Dataset loaded successfully")
+            # Since APE-data contains ZIP files, we need to list and download them directly
+            if not HF_HUB_AVAILABLE:
+                raise ImportError("huggingface_hub is required. Install with: pip install huggingface_hub")
+
+            print("Listing files in repository...")
+            all_files = list(list_repo_files(dataset_name, repo_type="dataset"))
+
+            # Filter ZIP files by category
+            self.zip_files = []
+            for category in self.categories:
+                category_files = [f for f in all_files if f.startswith(f"{category}/") and f.endswith(".zip")]
+                self.zip_files.extend(category_files)
+
+            print(f"✓ Found {len(self.zip_files)} ZIP files to process")
+            print(f"  Categories: {', '.join(self.categories)}")
+
+            # Store dataset name for downloading files later
+            self.dataset_name = dataset_name
+            self.hf_dataset = None  # Not using load_dataset for ZIP files
+
         except Exception as e:
             print(f"✗ Failed to load dataset: {e}")
             print("\nPossible solutions:")
@@ -146,8 +167,36 @@ class APEHuggingFaceDataset(IterableDataset):
         # This is a generic implementation that should work with common formats
 
         try:
+            # Method 0: If we extracted from ZIP and have a case_dir
+            if 'case_dir' in sample:
+                case_dir = Path(sample['case_dir'])
+                # Look for subdirectories containing DICOM files (1/ and 2/ or baseline/ and followup/)
+                subdirs = [d for d in case_dir.iterdir() if d.is_dir()]
+
+                if len(subdirs) >= 2:
+                    # Sort to ensure consistent ordering
+                    subdirs = sorted(subdirs)
+                    baseline_volume = self._load_dicom_directory(subdirs[0])
+                    followup_volume = self._load_dicom_directory(subdirs[1])
+                    return baseline_volume, followup_volume
+                elif len(subdirs) == 1:
+                    # If only 1 subdirectory, look for subdirectories inside it
+                    inner_dir = subdirs[0]
+                    inner_subdirs = [d for d in inner_dir.iterdir() if d.is_dir()]
+                    if len(inner_subdirs) >= 2:
+                        inner_subdirs = sorted(inner_subdirs)
+                        baseline_volume = self._load_dicom_directory(inner_subdirs[0])
+                        followup_volume = self._load_dicom_directory(inner_subdirs[1])
+                        return baseline_volume, followup_volume
+                    else:
+                        print(f"Warning: Found 1 subdirectory but it contains {len(inner_subdirs)} subdirectories")
+                        return None, None
+                else:
+                    print(f"Warning: Expected at least 1 subdirectory in {case_dir}, found {len(subdirs)}")
+                    return None, None
+
             # Method 1: If data is stored as files
-            if 'baseline' in sample and 'followup' in sample:
+            elif 'baseline' in sample and 'followup' in sample:
                 baseline_volume = self._process_dicom_data(sample['baseline'])
                 followup_volume = self._process_dicom_data(sample['followup'])
                 return baseline_volume, followup_volume
@@ -174,6 +223,59 @@ class APEHuggingFaceDataset(IterableDataset):
         except Exception as e:
             print(f"Error loading DICOM from HuggingFace sample: {e}")
             return None, None
+
+    def _load_dicom_directory(self, directory: Path) -> Optional[np.ndarray]:
+        """
+        Load all DICOM files from a directory and stack them into a 3D volume
+
+        Args:
+            directory: Path to directory containing DICOM files
+
+        Returns:
+            3D numpy array of shape (num_slices, H, W) or None on error
+        """
+        if not PYDICOM_AVAILABLE:
+            print("Error: pydicom is required to load DICOM files")
+            return None
+
+        try:
+            # Get all DICOM files in the directory (recursively)
+            # DICOM files might be nested in subdirectories
+            dicom_files = []
+            for pattern in ['**/*', '*']:
+                files = list(directory.glob(pattern))
+                dicom_files.extend([f for f in files if f.is_file() and not f.name.startswith('.')])
+                if dicom_files:
+                    break
+
+            dicom_files = sorted(dicom_files)
+
+            if not dicom_files:
+                print(f"No DICOM files found in {directory}")
+                return None
+
+            # Load all DICOM slices
+            slices = []
+            for dicom_file in dicom_files:
+                try:
+                    ds = pydicom.dcmread(str(dicom_file))
+                    if hasattr(ds, 'pixel_array'):
+                        slices.append(ds.pixel_array)
+                except Exception as e:
+                    # Silently skip files that can't be read (like DICOMDIR, LOCKFILE, etc.)
+                    continue
+
+            if not slices:
+                print(f"No valid DICOM slices found in {directory}")
+                return None
+
+            # Stack into 3D volume
+            volume = np.stack(slices, axis=0)
+            return volume
+
+        except Exception as e:
+            print(f"Error loading DICOM directory {directory}: {e}")
+            return None
 
     def _process_dicom_data(self, data):
         """Process DICOM data (could be files, bytes, or arrays)"""
@@ -283,10 +385,80 @@ class APEHuggingFaceDataset(IterableDataset):
 
     def __iter__(self):
         """Iterate over the dataset"""
-        for sample in self.hf_dataset:
-            processed = self._process_sample(sample)
-            if processed is not None:
-                yield processed
+        import zipfile
+
+        # Track number of samples yielded
+        samples_yielded = 0
+
+        # If using old load_dataset approach (won't work for ZIP files)
+        if self.hf_dataset is not None:
+            for sample in self.hf_dataset:
+                if self.max_samples is not None and samples_yielded >= self.max_samples:
+                    break
+                processed = self._process_sample(sample)
+                if processed is not None:
+                    yield processed
+                    samples_yielded += 1
+        # New approach: Download and process ZIP files one by one
+        else:
+            # Only process the first max_samples ZIP files
+            zip_files_to_process = self.zip_files
+            if self.max_samples is not None:
+                zip_files_to_process = self.zip_files[:self.max_samples]
+                print(f"Processing only first {self.max_samples} ZIP files (max_samples limit)")
+
+            # Create persistent cache directory for extracted files
+            if self.cache_dir:
+                extract_cache_dir = Path(self.cache_dir) / "extracted_zips"
+            else:
+                extract_cache_dir = Path.home() / ".cache" / "huggingface" / "datasets" / "extracted_zips"
+            extract_cache_dir.mkdir(parents=True, exist_ok=True)
+
+            for zip_file_path in zip_files_to_process:
+                # Double-check limit in case processing fails for some files
+                if self.max_samples is not None and samples_yielded >= self.max_samples:
+                    print(f"Reached max_samples limit ({self.max_samples}), stopping dataset iteration")
+                    break
+                try:
+                    # Download ZIP file from HuggingFace (cached)
+                    local_zip_path = hf_hub_download(
+                        repo_id=self.dataset_name,
+                        filename=zip_file_path,
+                        repo_type="dataset",
+                        cache_dir=self.cache_dir
+                    )
+
+                    # Create a unique cache directory for this ZIP file
+                    zip_hash = Path(zip_file_path).stem  # e.g., "case_001"
+                    cached_extract_dir = extract_cache_dir / zip_hash
+
+                    # Only extract if not already cached
+                    if not cached_extract_dir.exists():
+                        print(f"Extracting {zip_file_path}...")
+                        with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
+                            zip_ref.extractall(cached_extract_dir)
+                    else:
+                        print(f"Using cached extraction: {zip_file_path}")
+
+                    # Process the extracted case (similar to local APEDataset)
+                    case_dir = cached_extract_dir
+                    # Extract category from ZIP file path (e.g., "APE/case_001.zip" -> "APE")
+                    category = zip_file_path.split('/')[0]
+                    # Extract patient ID from filename
+                    patient_id = Path(zip_file_path).stem  # e.g., "case_001"
+                    sample = {
+                        'case_dir': str(case_dir),
+                        'category': category,
+                        'patient_id': patient_id
+                    }
+                    processed = self._process_sample(sample)
+                    if processed is not None:
+                        yield processed
+                        samples_yielded += 1
+
+                except Exception as e:
+                    print(f"Error processing {zip_file_path}: {e}")
+                    continue
 
 
 def get_ape_hf_dataloader(
@@ -298,6 +470,7 @@ def get_ape_hf_dataloader(
     num_workers: int = 4,
     categories: Optional[List[str]] = None,
     streaming: bool = True,
+    max_samples: Optional[int] = None,
     **kwargs
 ) -> DataLoader:
     """
@@ -336,6 +509,7 @@ def get_ape_hf_dataloader(
         resolution=resolution,
         categories=categories,
         streaming=streaming,
+        max_samples=max_samples,
         **kwargs
     )
 

@@ -144,7 +144,8 @@ def _get_hf_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
         streaming=streaming,
         window_center=config.get('window_center', 40),
         window_width=config.get('window_width', 400),
-        cache_dir=config.get('cache_dir')
+        cache_dir=config.get('cache_dir'),
+        max_samples=config.get('max_samples')
     )
 
 

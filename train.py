@@ -10,7 +10,7 @@ import random
 import numpy as np
 
 from models import VideoToVideoDiffusion
-from data import get_dataloader
+from data import get_unified_dataloader as get_dataloader
 from training import Trainer, get_scheduler
 from utils import setup_logger
 
@@ -40,7 +40,7 @@ def main(args):
     set_seed(config.get('seed', 42))
 
     # Setup logger
-    log_dir = Path(config['training']['log_dir']) / config['experiment_name']
+    log_dir = Path(config['training']['log_dir']) / config['training']['experiment_name']
     logger = setup_logger('training', log_file=log_dir / 'train.log')
 
     logger.info("=" * 80)
@@ -61,6 +61,51 @@ def main(args):
     logger.info(f"  VAE: {param_counts['vae']:,}")
     logger.info(f"  U-Net: {param_counts['unet']:,}")
 
+    # Load pretrained VAE weights if configured
+    if config.get('pretrained', {}).get('use_pretrained', False):
+        from utils.pretrained import (
+            load_pretrained_opensora_vae,
+            load_pretrained_cogvideox_vae,
+            load_pretrained_sd_vae,
+            map_sd_vae_to_video_vae
+        )
+
+        vae_config = config['pretrained'].get('vae', {})
+        if vae_config.get('enabled', False):
+            model_name = vae_config.get('model_name', 'hpcai-tech/OpenSora-VAE-v1.2')
+            inflate_method = vae_config.get('inflate_method', 'central')
+
+            logger.info(f"Loading pretrained VAE from {model_name}...")
+
+            try:
+                # Determine which loader to use
+                if 'OpenSora' in model_name or 'opensora' in model_name.lower():
+                    vae_state_dict = load_pretrained_opensora_vae(model_name)
+                elif 'CogVideo' in model_name:
+                    vae_state_dict = load_pretrained_cogvideox_vae(model_name)
+                elif 'stable' in model_name.lower() or 'sd-' in model_name:
+                    vae_state_dict = load_pretrained_sd_vae(model_name)
+                    # Inflate 2D->3D for Stable Diffusion VAE
+                    vae_state_dict = map_sd_vae_to_video_vae(vae_state_dict, inflate_method)
+                else:
+                    logger.warning(f"Unknown VAE model: {model_name}, skipping pretrained loading")
+                    vae_state_dict = None
+
+                if vae_state_dict is not None:
+                    # Load weights into model's VAE
+                    missing_keys, unexpected_keys = model.vae.load_state_dict(vae_state_dict, strict=False)
+
+                    if len(missing_keys) > 0:
+                        logger.warning(f"Missing keys in VAE: {len(missing_keys)} keys")
+                    if len(unexpected_keys) > 0:
+                        logger.warning(f"Unexpected keys in VAE: {len(unexpected_keys)} keys")
+
+                    logger.info("✓ Successfully loaded pretrained VAE weights")
+
+            except Exception as e:
+                logger.error(f"Failed to load pretrained VAE: {e}")
+                logger.info("Continuing with randomly initialized VAE")
+
     model = model.to(device)
 
     # Create dataloaders
@@ -68,21 +113,58 @@ def main(args):
     train_dataloader = get_dataloader(config['data'], split='train')
     val_dataloader = None  # Add validation dataloader if needed
 
-    logger.info(f"Training batches: {len(train_dataloader)}")
+    # Note: Streaming datasets don't support len()
+    try:
+        logger.info(f"Training batches: {len(train_dataloader)}")
+    except TypeError:
+        logger.info("Training batches: Unknown (streaming dataset)")
 
-    # Create optimizer
+    # Create optimizer with layer-wise learning rates
     optimizer_name = config['training'].get('optimizer', 'adam').lower()
-    lr = config['training']['learning_rate']
-    weight_decay = config['training'].get('weight_decay', 0.0)
+    base_lr = float(config['training']['learning_rate'])
+    weight_decay = float(config['training'].get('weight_decay', 0.0))
+
+    # Setup parameter groups with layer-wise learning rates
+    param_groups = []
+
+    # Get layer-wise LR multipliers from config
+    lr_multipliers = config.get('pretrained', {}).get('layer_lr_multipliers', {})
+    vae_encoder_mult = lr_multipliers.get('vae_encoder', 1.0)
+    vae_decoder_mult = lr_multipliers.get('vae_decoder', 1.0)
+    unet_mult = lr_multipliers.get('unet', 1.0)
+
+    # VAE encoder parameters
+    param_groups.append({
+        'params': model.vae.encoder.parameters(),
+        'lr': base_lr * vae_encoder_mult,
+        'name': 'vae_encoder'
+    })
+
+    # VAE decoder parameters
+    param_groups.append({
+        'params': model.vae.decoder.parameters(),
+        'lr': base_lr * vae_decoder_mult,
+        'name': 'vae_decoder'
+    })
+
+    # U-Net parameters
+    param_groups.append({
+        'params': model.unet.parameters(),
+        'lr': base_lr * unet_mult,
+        'name': 'unet'
+    })
 
     if optimizer_name == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(param_groups, weight_decay=weight_decay)
     elif optimizer_name == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-    logger.info(f"Optimizer: {optimizer_name}, LR: {lr}")
+    logger.info(f"Optimizer: {optimizer_name}, Base LR: {base_lr}")
+    logger.info(f"  VAE Encoder LR: {base_lr * vae_encoder_mult}")
+    logger.info(f"  VAE Decoder LR: {base_lr * vae_decoder_mult}")
+    logger.info(f"  U-Net LR: {base_lr * unet_mult}")
 
     # Create scheduler
     scheduler_config = {
@@ -95,7 +177,7 @@ def main(args):
     logger.info(f"Scheduler: {scheduler_config['scheduler_type']}")
 
     # Create trainer
-    checkpoint_dir = Path(config['training']['checkpoint_dir']) / config['experiment_name']
+    checkpoint_dir = Path(config['training']['checkpoint_dir']) / config['training']['experiment_name']
 
     trainer = Trainer(
         model=model,
@@ -106,7 +188,8 @@ def main(args):
         config=config['training'],
         device=device,
         log_dir=str(log_dir),
-        checkpoint_dir=str(checkpoint_dir)
+        checkpoint_dir=str(checkpoint_dir),
+        pretrained_config=config.get('pretrained', {})
     )
 
     # Resume from checkpoint if specified

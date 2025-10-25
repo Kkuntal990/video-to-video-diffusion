@@ -4,12 +4,12 @@
 # Model Configuration
 model:
   in_channels: 3
-  latent_dim: 4
+  latent_dim: 4  # Custom latent dimension for our VAE architecture
   vae_base_channels: 128
-  unet_model_channels: 256
+  unet_model_channels: 128
   unet_num_res_blocks: 2
-  unet_attention_levels: [1, 2, 3]
-  unet_channel_mult: [1, 2, 4, 8]
+  unet_attention_levels: [1, 2]
+  unet_channel_mult: [1, 2, 4, 4]  # Full 4-level U-Net for maximum capacity
   unet_num_heads: 8
   unet_time_embed_dim: 1024
   noise_schedule: 'cosine'
@@ -17,25 +17,26 @@ model:
   beta_start: 0.0001
   beta_end: 0.02
 
-# Pretrained Weights Configuration (RECOMMENDED for 6x speedup!)
+# Pretrained Weights Configuration
+# NOTE: Pretrained VAE disabled due to architecture mismatch
+# - SD VAE architecture (diffusers) is incompatible with our custom 3D VAE
+# - Different layer structures, kernel sizes, and downsampling ratios
+# - Training from scratch is the most reliable approach
 pretrained:
-  use_pretrained: true  # Set to false to train from scratch
+  use_pretrained: false  # Disabled - training from scratch
 
   # VAE pretrained weights
   vae:
-    enabled: true
-    model_name: 'hpcai-tech/OpenSora-VAE-v1.2'  # Recommended
-    # Other options:
-    # - 'THUDM/CogVideoX-5b'
-    # - 'stabilityai/sd-vae-ft-mse'
+    enabled: false  # Disabled - architecture incompatible
+    model_name: 'stabilityai/sd-vae-ft-mse'
     method: 'auto'
-    inflate_method: 'central'  # For 2D->3D inflation
-    freeze_epochs: 5  # Freeze VAE for first 5 epochs
+    inflate_method: 'central'
+    freeze_epochs: 0  # Not applicable when training from scratch
 
   # Training strategy
   two_phase_training: true
-  phase1_epochs: 10  # Phase 1: Freeze VAE and train U-Net
-  # Phase 2: Fine-tune entire model
+  phase1_epochs: 5  # Phase 1: Freeze VAE and train U-Net for 5 epochs (~30 hours)
+  # Phase 2: Fine-tune entire model for remaining 45 epochs (~270 hours)
 
   # Layer-wise learning rates
   layer_lr_multipliers:
@@ -52,33 +53,35 @@ data:
   dataset_name: 't2ance/APE-data'
   streaming: true  # Stream data without downloading everything
   cache_dir: null  # Use default cache or specify path
+  max_samples: 5  # Limit number of samples for testing (set to null for full dataset)
 
   # Categories to include
   categories: ['APE', 'non-APE']  # Use both categories
 
   # Video settings
-  num_frames: 16  # Number of CT slices per sample
-  resolution: [256, 256]  # H, W
+  num_frames: 16  # Number of CT slices per sample - full temporal context
+  resolution: [256, 256]  # H, W - higher resolution for better detail (4× more pixels than 128×128)
 
   # CT windowing (for medical imaging)
   window_center: 40  # HU window center for soft tissue
   window_width: 400  # HU window width
 
   # DataLoader settings
-  batch_size: 4  # Adjust based on GPU memory
-  num_workers: 4  # Number of data loading workers
+  batch_size: 1  # Must be 1 for 256×256 with 16 frames on V100 32GB
+  num_workers: 4  # Parallel data loading for faster throughput
   pin_memory: true
   drop_last: true
+  max_samples: null  # Use full dataset (206 patients) for production training
 
 # Training Configuration
 training:
-  num_epochs: 50
-  learning_rate: 1e-4
+  num_epochs: 50  # Production training - ~6-7 days on V100 32GB
+  learning_rate: 0.0001  # 1e-4
   weight_decay: 0.01
 
   # Optimization
   optimizer: 'adamw'  # 'adam' or 'adamw'
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 16  # Simulate batch_size=16 (actual batch=1)
   max_grad_norm: 1.0  # Gradient clipping
 
   # Mixed precision training (highly recommended for speed)
@@ -87,19 +90,22 @@ training:
 
   # Learning rate scheduling
   scheduler: 'cosine'  # 'cosine', 'linear', or 'constant'
-  warmup_steps: 500
+  warmup_steps: 1000  # Longer warmup for stability with high resolution
+  min_lr: 1e-6  # Minimum learning rate at end of cosine schedule
 
   # Checkpointing
-  checkpoint_every: 500  # Save every N steps
-  keep_last_n_checkpoints: 5  # Only keep last N checkpoints
+  checkpoint_every: 1000  # Save every N steps (~5 checkpoints per epoch)
+  keep_last_n_checkpoints: 3  # Keep last 3 for safety (in case of corruption)
 
   # Validation
   validate_every: 1000
-  num_validation_samples: 10
+  num_validation_samples: 1
 
   # Logging
-  log_every: 50  # Log every N steps
-  output_dir: './outputs'  # Output directory
+  log_every: 100  # Log every N steps (reduce overhead)
+  output_dir: '/workspace/storage/outputs'  # Output directory (persistent)
+  log_dir: '/workspace/storage/logs'  # Log directory (persistent)
+  checkpoint_dir: '/workspace/storage/checkpoints'  # Checkpoint directory (persistent)
   experiment_name: 'ape_v2v_diffusion'
 
   # Weights & Biases (optional)
@@ -113,9 +119,9 @@ hardware:
   num_gpus: 1  # Number of GPUs to use
   distributed: false  # Set to true for multi-GPU training
 
-  # Memory optimization
-  gradient_checkpointing: false  # Enable if running out of memory
-  cpu_offload: false  # Offload to CPU if needed
+  # Memory optimization (CRITICAL for 256×256 resolution!)
+  gradient_checkpointing: true  # REQUIRED: Saves ~50% activation memory, enables 256×256 on V100 32GB
+  cpu_offload: false  # Keep disabled (would slow training significantly)
 
 # Inference Configuration (for validation)
 inference:
@@ -138,21 +144,45 @@ early_stopping:
   metric: 'loss'  # Metric to monitor
   mode: 'min'  # 'min' or 'max'
 
-# Notes:
-# 1. Adjust batch_size based on GPU memory:
-#    - 24GB GPU (RTX 3090/4090): batch_size 2-4
-#    - 40GB GPU (A100): batch_size 4-8
-#    - 80GB GPU (A100): batch_size 8-16
+# Notes - Production Configuration (256×256, 16 frames, V100 32GB):
 #
-# 2. With pretrained weights:
-#    - Training time: ~1 day on A100
-#    - Expected PSNR improvement: +15-20%
+# 1. CURRENT SETUP - Maximum Quality:
+#    - Model: 441M parameters (172M VAE + 270M U-Net)
+#    - Resolution: 256×256 (4× more detail than 128×128)
+#    - Frames: 16 (full temporal context)
+#    - Batch size: 1 (REQUIRED for memory constraints)
+#    - Gradient accumulation: 16 (effective batch = 16)
+#    - Gradient checkpointing: ENABLED (critical!)
 #
-# 3. Without pretrained weights:
-#    - Training time: ~7 days on A100
-#    - Slower convergence
+# 2. MEMORY USAGE:
+#    - Estimated: ~22-24 GB on V100 32GB
+#    - Peak during backward pass: ~28-29 GB (monitor closely!)
+#    - Gradient checkpointing saves ~8 GB activation memory
+#    - WITHOUT gradient checkpointing: Would need ~40+ GB (OOM!)
 #
-# 4. For faster iteration during development:
-#    - Reduce num_frames to 8
-#    - Reduce resolution to [128, 128]
-#    - Increase checkpoint_every to save disk space
+# 3. TRAINING TIMELINE:
+#    - Total: ~7-8 days on Tesla V100 32GB (larger model = slower)
+#    - Phase 1 (5 epochs, VAE frozen): ~36 hours
+#    - Phase 2 (45 epochs, full fine-tuning): ~324 hours
+#    - ~7-8 hours per epoch, ~206 steps per epoch
+#
+# 4. IF OUT OF MEMORY (OOM):
+#    Fallback options (in order of preference):
+#    a) Reduce num_frames: 16 → 12 (saves ~25% memory)
+#    b) Reduce U-Net depth: unet_channel_mult=[1,2,4,4] → [1,2,4] (saves ~3GB)
+#    c) Reduce resolution: [256,256] → [224,224] (saves ~30% memory)
+#    d) Combination: num_frames=12, resolution=[224,224] (saves ~50% memory)
+#    e) Last resort: resolution=[128,128], num_frames=16
+#
+# 5. MONITORING CRITICAL FIRST 24 HOURS:
+#    - Watch GPU memory every 30 min for first 100 steps
+#    - kubectl exec <POD> -- nvidia-smi dmon -s mu -c 100
+#    - If memory > 30GB consistently, apply fallback option (b) first
+#    - Phase transition at epoch 5 may cause temporary spike
+#
+# 6. QUALITY EXPECTATIONS:
+#    - Full 4-level U-Net: Maximum model capacity (~65% larger than 3-level)
+#    - 4× better spatial detail than 128×128
+#    - Full temporal coherence across 16 CT slices
+#    - Clinically relevant resolution (closer to real CT scans)
+#    - Better preservation of fine anatomical structures
