@@ -40,20 +40,15 @@ class VideoTransform:
 
         Args:
             frames: numpy array (T, H, W, 3) in [0, 255]
+                   NOTE: Frame sampling should already be done in dataset!
 
         Returns:
             video: torch tensor (3, T, H, W) in [-1, 1]
         """
-        # Ensure we have the right number of frames
-        if len(frames) > self.num_frames:
-            # Uniformly sample frames
-            indices = np.linspace(0, len(frames) - 1, self.num_frames, dtype=int)
-            frames = frames[indices]
-        elif len(frames) < self.num_frames:
-            # Pad with last frame
-            pad_length = self.num_frames - len(frames)
-            last_frame = frames[-1:].repeat(pad_length, axis=0)
-            frames = np.concatenate([frames, last_frame], axis=0)
+        # Frame sampling removed - already done in APEHuggingFaceDataset._sample_frames()
+        # This eliminates redundant sampling and improves performance
+        assert len(frames) == self.num_frames, \
+            f"Expected {self.num_frames} frames, got {len(frames)}. Frame sampling should be done in dataset!"
 
         # Resize frames
         resized_frames = []

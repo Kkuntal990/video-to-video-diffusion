@@ -111,7 +111,10 @@ def main(args):
     # Create dataloaders
     logger.info("Creating dataloaders...")
     train_dataloader = get_dataloader(config['data'], split='train')
-    val_dataloader = None  # Add validation dataloader if needed
+
+    # Create validation dataloader (15% of data, stratified by category)
+    logger.info("Creating validation dataloader...")
+    val_dataloader = get_dataloader(config['data'], split='val')
 
     # Note: Streaming datasets don't support len()
     try:
@@ -196,6 +199,18 @@ def main(args):
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
         trainer.load_checkpoint(args.resume)
+    else:
+        # Auto-detect best checkpoint in checkpoint directory
+        checkpoint_dir_path = Path(checkpoint_dir)
+        best_checkpoints = list(checkpoint_dir_path.glob('checkpoint_best_*.pt'))
+        if best_checkpoints:
+            # Find the best checkpoint (most recent if multiple)
+            best_checkpoint = max(best_checkpoints, key=lambda p: p.stat().st_mtime)
+            logger.info(f"Found existing best checkpoint: {best_checkpoint}")
+            logger.info(f"Resuming from best checkpoint...")
+            trainer.load_checkpoint(str(best_checkpoint))
+        else:
+            logger.info("No existing checkpoint found. Starting training from scratch.")
 
     # Start training
     logger.info("Starting training...")

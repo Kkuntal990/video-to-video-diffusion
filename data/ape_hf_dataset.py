@@ -112,6 +112,15 @@ class APEHuggingFaceDataset(IterableDataset):
         self.cache_dir = cache_dir
         self.max_samples = max_samples
 
+        # Blacklist of verified corrupted cases (empty DICOM data at source)
+        # Verified by manual download - these cases have only admin files
+        self.corrupted_cases = {
+            'case_190', 'case_191', 'case_192', 'case_193', 'case_194',
+            'case_195', 'case_196', 'case_197', 'case_198', 'case_199',
+            'case_200', 'case_201', 'case_202', 'case_203', 'case_204',
+            'case_205', 'case_206'
+        }
+
         # Default transform
         if transform is None:
             self.transform = VideoTransform(resolution=resolution, num_frames=num_frames)
@@ -138,7 +147,21 @@ class APEHuggingFaceDataset(IterableDataset):
                 category_files = [f for f in all_files if f.startswith(f"{category}/") and f.endswith(".zip")]
                 self.zip_files.extend(category_files)
 
-            print(f"✓ Found {len(self.zip_files)} ZIP files to process")
+            # Filter out corrupted cases
+            valid_zip_files = []
+            corrupted_count = 0
+            for zip_file in self.zip_files:
+                zip_hash = Path(zip_file).stem
+                if zip_hash not in self.corrupted_cases:
+                    valid_zip_files.append(zip_file)
+                else:
+                    corrupted_count += 1
+
+            self.zip_files = valid_zip_files
+
+            print(f"✓ Found {len(self.zip_files)} valid ZIP files to process")
+            if corrupted_count > 0:
+                print(f"  ⚠ Skipping {corrupted_count} corrupted cases (no DICOM data)")
             print(f"  Categories: {', '.join(self.categories)}")
 
             # Store dataset name for downloading files later
@@ -171,27 +194,39 @@ class APEHuggingFaceDataset(IterableDataset):
             if 'case_dir' in sample:
                 case_dir = Path(sample['case_dir'])
                 # Look for subdirectories containing DICOM files (1/ and 2/ or baseline/ and followup/)
-                subdirs = [d for d in case_dir.iterdir() if d.is_dir()]
+                # Filter out hidden directories (starting with '.')
+                subdirs = [d for d in case_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
 
                 if len(subdirs) >= 2:
-                    # Sort to ensure consistent ordering
-                    subdirs = sorted(subdirs)
+                    # Sort to ensure consistent ordering (by name)
+                    subdirs = sorted(subdirs, key=lambda x: x.name)
                     baseline_volume = self._load_dicom_directory(subdirs[0])
                     followup_volume = self._load_dicom_directory(subdirs[1])
                     return baseline_volume, followup_volume
                 elif len(subdirs) == 1:
-                    # If only 1 subdirectory, look for subdirectories inside it
+                    # If only 1 subdirectory, look for subdirectories inside it (patient folder structure)
                     inner_dir = subdirs[0]
-                    inner_subdirs = [d for d in inner_dir.iterdir() if d.is_dir()]
+                    # Filter out hidden directories and look for numeric folders (1, 2, etc.)
+                    inner_subdirs = [d for d in inner_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
                     if len(inner_subdirs) >= 2:
-                        inner_subdirs = sorted(inner_subdirs)
+                        # Sort numerically if possible, otherwise alphabetically
+                        try:
+                            inner_subdirs = sorted(inner_subdirs, key=lambda x: int(x.name))
+                        except ValueError:
+                            inner_subdirs = sorted(inner_subdirs, key=lambda x: x.name)
                         baseline_volume = self._load_dicom_directory(inner_subdirs[0])
                         followup_volume = self._load_dicom_directory(inner_subdirs[1])
                         return baseline_volume, followup_volume
                     else:
+                        # Debug: List what's actually in the directory
+                        all_items = list(inner_dir.iterdir())
+                        print(f"Debug: Contents of {inner_dir.name}: {[item.name for item in all_items]}")
                         print(f"Warning: Found 1 subdirectory but it contains {len(inner_subdirs)} subdirectories")
                         return None, None
                 else:
+                    # Debug: List what's actually in the case directory
+                    all_items = list(case_dir.iterdir())
+                    print(f"Debug: Contents of {case_dir.name}: {[item.name for item in all_items]}")
                     print(f"Warning: Expected at least 1 subdirectory in {case_dir}, found {len(subdirs)}")
                     return None, None
 
@@ -241,32 +276,55 @@ class APEHuggingFaceDataset(IterableDataset):
         try:
             # Get all DICOM files in the directory (recursively)
             # DICOM files might be nested in subdirectories
-            dicom_files = []
-            for pattern in ['**/*', '*']:
-                files = list(directory.glob(pattern))
-                dicom_files.extend([f for f in files if f.is_file() and not f.name.startswith('.')])
-                if dicom_files:
-                    break
+            # First try direct files (faster), then recursive if needed
+            # IMPORTANT: Filter out known non-DICOM files (LOCKFILE, VERSION, .DS_Store, etc.)
+            non_dicom_files = {'LOCKFILE', 'VERSION', 'DICOMDIR', '.DS_Store', 'Thumbs.db'}
 
-            dicom_files = sorted(dicom_files)
+            dicom_files = [f for f in directory.iterdir()
+                          if f.is_file()
+                          and not f.name.startswith('.')
+                          and f.name not in non_dicom_files]
+
+            # If no files in root, search recursively
+            if not dicom_files:
+                dicom_files = [f for f in directory.rglob('*')
+                              if f.is_file()
+                              and not f.name.startswith('.')
+                              and f.name not in non_dicom_files]
+
+            dicom_files = sorted(dicom_files, key=lambda x: x.name)
 
             if not dicom_files:
+                # Debug: Show what files ARE in the directory
+                all_files = list(directory.rglob('*'))
+                file_list = [f.name for f in all_files if f.is_file()][:10]  # First 10 files
                 print(f"No DICOM files found in {directory}")
+                print(f"  Directory contains {len([f for f in all_files if f.is_file()])} total files")
+                if file_list:
+                    print(f"  Sample files: {file_list}")
                 return None
 
             # Load all DICOM slices
             slices = []
+            errors_encountered = []
             for dicom_file in dicom_files:
                 try:
                     ds = pydicom.dcmread(str(dicom_file))
                     if hasattr(ds, 'pixel_array'):
                         slices.append(ds.pixel_array)
                 except Exception as e:
-                    # Silently skip files that can't be read (like DICOMDIR, LOCKFILE, etc.)
+                    # Track errors for debugging (only show first 3)
+                    if len(errors_encountered) < 3:
+                        errors_encountered.append(f"{dicom_file.name}: {str(e)[:50]}")
                     continue
 
             if not slices:
-                print(f"No valid DICOM slices found in {directory}")
+                if errors_encountered:
+                    print(f"No valid DICOM slices found in {directory}")
+                    print(f"  Sample errors: {errors_encountered}")
+                    print(f"  Total files tried: {len(dicom_files)}")
+                else:
+                    print(f"No DICOM files with pixel_array found in {directory}")
                 return None
 
             # Stack into 3D volume
@@ -408,10 +466,14 @@ class APEHuggingFaceDataset(IterableDataset):
                 print(f"Processing only first {self.max_samples} ZIP files (max_samples limit)")
 
             # Create persistent cache directory for extracted files
+            # Always use HuggingFace cache location to ensure persistence across pod restarts
             if self.cache_dir:
                 extract_cache_dir = Path(self.cache_dir) / "extracted_zips"
             else:
-                extract_cache_dir = Path.home() / ".cache" / "huggingface" / "datasets" / "extracted_zips"
+                # Use same base as HuggingFace downloads (persistent storage)
+                # This ensures extracted files survive pod restarts
+                hf_cache_home = os.environ.get('HF_HOME', os.environ.get('HUGGINGFACE_HUB_CACHE', Path.home() / '.cache' / 'huggingface'))
+                extract_cache_dir = Path(hf_cache_home) / "extracted_zips"
             extract_cache_dir.mkdir(parents=True, exist_ok=True)
 
             for zip_file_path in zip_files_to_process:
@@ -420,25 +482,64 @@ class APEHuggingFaceDataset(IterableDataset):
                     print(f"Reached max_samples limit ({self.max_samples}), stopping dataset iteration")
                     break
                 try:
-                    # Download ZIP file from HuggingFace (cached)
-                    local_zip_path = hf_hub_download(
-                        repo_id=self.dataset_name,
-                        filename=zip_file_path,
-                        repo_type="dataset",
-                        cache_dir=self.cache_dir
-                    )
-
                     # Create a unique cache directory for this ZIP file
                     zip_hash = Path(zip_file_path).stem  # e.g., "case_001"
+
+                    # Skip corrupted cases immediately (verified to have no DICOM data)
+                    if zip_hash in self.corrupted_cases:
+                        continue
+
                     cached_extract_dir = extract_cache_dir / zip_hash
 
-                    # Only extract if not already cached
+                    # Check if extraction exists FIRST (avoid unnecessary network calls)
+                    # Also validate that extraction has actual DICOM files
+                    needs_extraction = False
                     if not cached_extract_dir.exists():
+                        needs_extraction = True
+                    else:
+                        # Validate that cached extraction has subdirectories AND actual files
+                        subdirs = [d for d in cached_extract_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+                        if len(subdirs) == 0:
+                            print(f"Warning: Cached extraction {zip_hash} has no subdirectories, re-extracting...")
+                            needs_extraction = True
+                        else:
+                            # Check if there are any files at all (recursively)
+                            non_admin_files = {'LOCKFILE', 'VERSION', 'DICOMDIR', '.DS_Store', 'Thumbs.db'}
+                            all_files = [f for f in cached_extract_dir.rglob('*')
+                                        if f.is_file()
+                                        and not f.name.startswith('.')
+                                        and f.name not in non_admin_files]
+                            if len(all_files) == 0:
+                                print(f"Warning: Cached extraction {zip_hash} has no DICOM files, re-extracting...")
+                                needs_extraction = True
+
+                    if needs_extraction:
+                        # Download and extract
                         print(f"Extracting {zip_file_path}...")
+                        local_zip_path = hf_hub_download(
+                            repo_id=self.dataset_name,
+                            filename=zip_file_path,
+                            repo_type="dataset",
+                            cache_dir=self.cache_dir
+                        )
+
+                        # Clear existing directory if it exists
+                        if cached_extract_dir.exists():
+                            import shutil
+                            shutil.rmtree(cached_extract_dir)
+
+                        cached_extract_dir.mkdir(parents=True, exist_ok=True)
+
                         with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
                             zip_ref.extractall(cached_extract_dir)
-                    else:
-                        print(f"Using cached extraction: {zip_file_path}")
+
+                        # Delete ZIP file after successful extraction to save disk space
+                        try:
+                            os.remove(local_zip_path)
+                            print(f"  ✓ Deleted ZIP after extraction: {Path(local_zip_path).name}")
+                        except Exception as e:
+                            print(f"  Warning: Could not delete ZIP file: {e}")
+                    # If cached and validated, skip download entirely (no network call!)
 
                     # Process the extracted case (similar to local APEDataset)
                     case_dir = cached_extract_dir

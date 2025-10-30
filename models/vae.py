@@ -126,8 +126,12 @@ class VideoEncoder(nn.Module):
             ResBlock3D(base_channels * 4),
         )
 
-        # Output projection to latent space
-        self.conv_out = nn.Conv3d(base_channels * 4, latent_dim, kernel_size=1)
+        # Output projection to latent space (match SD VAE architecture)
+        # SD VAE: outputs 8 channels, then quantizes to latent_dim
+        self.conv_out = nn.Conv3d(base_channels * 4, 8, kernel_size=3, padding=1)
+
+        # Quantization layer: 8 → latent_dim (typically 4)
+        self.quant_conv = nn.Conv3d(8, latent_dim, kernel_size=1)
 
     def forward(self, x):
         # Input: (B, 3, T, H, W)
@@ -136,7 +140,8 @@ class VideoEncoder(nn.Module):
         x = self.down2(x)         # (B, 256, T, H//4, W//4)
         x = self.down3(x)         # (B, 256, T, H//8, W//8)
         x = self.mid(x)           # (B, 256, T, H//8, W//8)
-        x = self.conv_out(x)      # (B, latent_dim, T, H//8, W//8)
+        x = self.conv_out(x)      # (B, 8, T, H//8, W//8)
+        x = self.quant_conv(x)    # (B, latent_dim, T, H//8, W//8)
         return x
 
 
@@ -150,8 +155,11 @@ class VideoDecoder(nn.Module):
     def __init__(self, latent_dim=4, out_channels=3, base_channels=64):
         super().__init__()
 
+        # Post-quantization layer: latent_dim → 8 (match SD VAE architecture)
+        self.post_quant_conv = nn.Conv3d(latent_dim, 8, kernel_size=1)
+
         # Input projection from latent space
-        self.conv_in = Conv3DBlock(latent_dim, base_channels * 4)
+        self.conv_in = Conv3DBlock(8, base_channels * 4)
 
         # Middle blocks
         self.mid = nn.Sequential(
@@ -183,6 +191,7 @@ class VideoDecoder(nn.Module):
 
     def forward(self, x):
         # Input: (B, latent_dim, T, H//8, W//8)
+        x = self.post_quant_conv(x)  # (B, 8, T, H//8, W//8)
         x = self.conv_in(x)       # (B, 256, T, H//8, W//8)
         x = self.mid(x)           # (B, 256, T, H//8, W//8)
         x = self.up1(x)           # (B, 256, T, H//4, W//4)

@@ -8,6 +8,7 @@ import torch
 from pathlib import Path
 from .sampler import DDIMSampler, DDPMSampler
 from data.transforms import save_video, load_video, VideoTransform, DenormalizeVideo
+from utils.metrics import calculate_video_metrics
 
 
 def generate_video(

@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: v2v-diffuser-kuntal-a100
+  labels:
+    app: v2v-diffusion
+    gpu: rtx-a100
+    purpose: training-storage
+    config: 24-frames-256x256
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 300Gi  
+
+# Storage breakdown:
+# - Model checkpoints: ~1.8 GB each (441M params)
+# - 5 checkpoints: ~9 GB
+# - Logs and outputs: ~3-5 GB
+# - Cache (HuggingFace, PyTorch): ~5-10 GB
+# - Validation samples: ~2-3 GB
+# Total estimated usage: ~20-30 GB
+# 50GB provides comfortable headroom for experiments

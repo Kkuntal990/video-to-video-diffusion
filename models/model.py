@@ -194,15 +194,20 @@ class VideoToVideoDiffusion(nn.Module):
 
         return v_out
 
-    def save_checkpoint(self, path, optimizer=None, epoch=None, global_step=None):
+    def save_checkpoint(self, path, optimizer=None, scheduler=None, epoch=None, global_step=None,
+                       current_phase=None, best_loss=None, **kwargs):
         """
         Save model checkpoint
 
         Args:
             path: save path
             optimizer: optimizer state (optional)
+            scheduler: scheduler state (optional)
             epoch: current epoch (optional)
             global_step: current global step (optional)
+            current_phase: current training phase for two-phase training (optional)
+            best_loss: best validation loss (optional)
+            **kwargs: additional state to save
         """
         checkpoint = {
             'model_state_dict': self.state_dict(),
@@ -211,10 +216,19 @@ class VideoToVideoDiffusion(nn.Module):
 
         if optimizer is not None:
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
         if epoch is not None:
             checkpoint['epoch'] = epoch
         if global_step is not None:
             checkpoint['global_step'] = global_step
+        if current_phase is not None:
+            checkpoint['current_phase'] = current_phase
+        if best_loss is not None:
+            checkpoint['best_loss'] = best_loss
+
+        # Add any additional kwargs
+        checkpoint.update(kwargs)
 
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
@@ -232,7 +246,8 @@ class VideoToVideoDiffusion(nn.Module):
             model: loaded model
             checkpoint: full checkpoint dict (contains optimizer state, etc.)
         """
-        checkpoint = torch.load(path, map_location=device)
+        # weights_only=False is required to load optimizer/scheduler states
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
 
         # Create model from config
         model = cls(checkpoint['config'])

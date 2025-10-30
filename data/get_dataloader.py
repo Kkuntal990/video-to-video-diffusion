@@ -125,28 +125,57 @@ def _get_local_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
 
 def _get_hf_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
     """Get dataloader for HuggingFace dataset"""
-    from .ape_hf_dataset import get_ape_hf_dataloader
-
     dataset_name = config.get('dataset_name', 't2ance/APE-data')
     streaming = config.get('streaming', True)
+    use_cache = config.get('use_cache', True)
 
     print(f"Loading data from HuggingFace: {dataset_name}")
-    print(f"Streaming mode: {streaming}")
 
-    return get_ape_hf_dataloader(
-        dataset_name=dataset_name,
-        split=split,
-        num_frames=config.get('num_frames', 16),
-        resolution=tuple(config.get('resolution', [256, 256])),
-        batch_size=config.get('batch_size', 4),
-        num_workers=config.get('num_workers', 4),
-        categories=config.get('categories'),
-        streaming=streaming,
-        window_center=config.get('window_center', 40),
-        window_width=config.get('window_width', 400),
-        cache_dir=config.get('cache_dir'),
-        max_samples=config.get('max_samples')
-    )
+    # Use cached preprocessing (recommended for persistent storage)
+    if use_cache and not streaming:
+        from .ape_cached_dataset import get_ape_cached_dataloader
+
+        print(f"Using CACHED mode (download + preprocess once, then load tensors)")
+        print(f"Cache directory: {config.get('cache_dir', '/workspace/storage/ape_cache')}")
+
+        return get_ape_cached_dataloader(
+            dataset_name=dataset_name,
+            cache_dir=config.get('cache_dir', '/workspace/storage/ape_cache'),
+            num_frames=config.get('num_frames', 16),
+            resolution=tuple(config.get('resolution', [256, 256])),
+            batch_size=config.get('batch_size', 4),
+            num_workers=config.get('num_workers', 4),
+            categories=config.get('categories'),
+            window_center=config.get('window_center', 40),
+            window_width=config.get('window_width', 400),
+            force_reprocess=config.get('force_reprocess', False),
+            split=split,
+            val_split=config.get('val_split', 0.15),
+            test_split=config.get('test_split', 0.10),
+            seed=config.get('seed', 42)
+        )
+
+    # Use streaming mode (old behavior)
+    else:
+        from .ape_hf_dataset import get_ape_hf_dataloader
+
+        print(f"Using STREAMING mode (downloads on-the-fly, preprocesses every epoch)")
+        print(f"⚠ WARNING: This is slow! Consider using use_cache=True with streaming=False")
+
+        return get_ape_hf_dataloader(
+            dataset_name=dataset_name,
+            split=split,
+            num_frames=config.get('num_frames', 16),
+            resolution=tuple(config.get('resolution', [256, 256])),
+            batch_size=config.get('batch_size', 4),
+            num_workers=config.get('num_workers', 4),
+            categories=config.get('categories'),
+            streaming=streaming,
+            window_center=config.get('window_center', 40),
+            window_width=config.get('window_width', 400),
+            cache_dir=config.get('cache_dir'),
+            max_samples=config.get('max_samples')
+        )
 
 
 def create_training_config(

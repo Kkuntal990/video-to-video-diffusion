@@ -10,6 +10,8 @@ from tqdm import tqdm
 import os
 from pathlib import Path
 import time
+import gc
+from utils.metrics import calculate_video_metrics
 
 
 class Trainer:
@@ -100,6 +102,8 @@ class Trainer:
         # Training state
         self.global_step = 0
         self.current_epoch = 0
+        self.best_loss = float('inf')  # Track best validation/training loss
+        self.best_checkpoint_path = None  # Track path to best checkpoint
 
         print(f"Trainer initialized:")
         print(f"  Device: {device}")
@@ -132,7 +136,9 @@ class Trainer:
     def train_epoch(self):
         """Train for one epoch"""
         self.model.train()
-        epoch_losses = []
+        epoch_losses = []  # Store loss tensors to avoid repeated CPU-GPU sync
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
 
         pbar = tqdm(self.train_dataloader, desc=f"Epoch {self.current_epoch}")
 
@@ -164,16 +170,20 @@ class Trainer:
                 else:
                     self.optimizer.step()
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)  # Faster memory release
 
             # Update global step
             self.global_step += 1
 
-            # Log metrics
-            loss_value = loss.item() * self.gradient_accumulation_steps
-            epoch_losses.append(loss_value)
+            # Track loss for epoch average (minimize CPU-GPU sync)
+            with torch.no_grad():
+                epoch_loss_sum += (loss * self.gradient_accumulation_steps).detach()
+                epoch_loss_count += 1
 
+            # Log metrics only at intervals
             if self.global_step % self.log_interval == 0:
+                loss_value = loss.item() * self.gradient_accumulation_steps
+
                 lr = self.optimizer.param_groups[0]['lr']
                 self.writer.add_scalar('train/loss', loss_value, self.global_step)
                 self.writer.add_scalar('train/lr', lr, self.global_step)
@@ -183,6 +193,9 @@ class Trainer:
                     'lr': f'{lr:.2e}',
                     'step': self.global_step
                 })
+
+                # Periodic garbage collection to prevent RAM buildup
+                gc.collect()
 
             # Validation
             if self.val_dataloader and self.global_step % self.val_interval == 0:
@@ -194,19 +207,32 @@ class Trainer:
             if self.global_step % self.checkpoint_interval == 0:
                 self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
 
-        # Average epoch loss
-        if len(epoch_losses) > 0:
-            avg_loss = sum(epoch_losses) / len(epoch_losses)
+        # Average epoch loss (convert to scalar only once at end of epoch)
+        if epoch_loss_count > 0:
+            avg_loss = (epoch_loss_sum / epoch_loss_count).item()
         else:
+            import logging
+            logger = logging.getLogger(__name__)
             logger.warning("No batches were processed in this epoch!")
             avg_loss = 0.0
+
+        # Force garbage collection after epoch completes to free RAM
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return avg_loss
 
     @torch.no_grad()
     def validate(self):
-        """Run validation"""
+        """Run validation with SSIM and PSNR metrics"""
         self.model.eval()
-        val_losses = []
+
+        # Use streaming average instead of list accumulation to save RAM
+        val_loss_sum = 0.0
+        psnr_sum = 0.0
+        ssim_sum = 0.0
+        val_count = 0
 
         pbar = tqdm(self.val_dataloader, desc="Validation")
 
@@ -214,19 +240,63 @@ class Trainer:
             v_in = batch['input'].to(self.device)
             v_gt = batch['target'].to(self.device)
 
-            # Forward pass
+            # Forward pass for loss
             if self.use_amp:
                 with autocast():
                     loss, metrics = self.model(v_in, v_gt)
             else:
                 loss, metrics = self.model(v_in, v_gt)
 
-            val_losses.append(loss.item())
+            # Generate prediction for SSIM/PSNR calculation
+            # Sample from the diffusion model
+            try:
+                if self.use_amp:
+                    with autocast():
+                        v_pred = self.model.sample(v_in, num_inference_steps=50)
+                else:
+                    v_pred = self.model.sample(v_in, num_inference_steps=50)
 
-            pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                # Calculate SSIM and PSNR metrics
+                # Clamp values to [0, 1] range for metric calculation
+                v_pred_clamped = torch.clamp(v_pred, 0, 1)
+                v_gt_clamped = torch.clamp(v_gt, 0, 1)
 
-        avg_val_loss = sum(val_losses) / len(val_losses)
-        print(f"Validation loss: {avg_val_loss:.4f}")
+                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=1.0)
+                psnr_sum += video_metrics['psnr']
+                ssim_sum += video_metrics['ssim']
+            except Exception as e:
+                # If sampling fails (e.g., model doesn't have sample method), skip metrics
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Could not calculate SSIM/PSNR: {e}")
+                psnr_sum += 0.0
+                ssim_sum += 0.0
+
+            # Accumulate loss sum
+            val_loss_sum += loss.item()
+            val_count += 1
+
+            pbar.set_postfix({
+                'val_loss': f'{loss.item():.4f}',
+                'psnr': f'{psnr_sum/val_count:.2f}' if val_count > 0 else 'N/A',
+                'ssim': f'{ssim_sum/val_count:.4f}' if val_count > 0 else 'N/A'
+            })
+
+        # Calculate averages
+        avg_val_loss = val_loss_sum / val_count if val_count > 0 else 0.0
+        avg_psnr = psnr_sum / val_count if val_count > 0 else 0.0
+        avg_ssim = ssim_sum / val_count if val_count > 0 else 0.0
+
+        print(f"Validation - Loss: {avg_val_loss:.4f}, PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}")
+
+        # Log metrics to TensorBoard
+        self.writer.add_scalar('val/psnr', avg_psnr, self.global_step)
+        self.writer.add_scalar('val/ssim', avg_ssim, self.global_step)
+
+        # Clean up after validation
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return avg_val_loss
 
@@ -238,8 +308,9 @@ class Trainer:
         except TypeError:
             print(f"Total steps: Unknown (streaming dataset)")
 
-        # Freeze VAE at start if configured
-        if self.use_two_phase or self.vae_freeze_epochs > 0:
+        # Freeze VAE at start if configured (only if starting fresh, not resuming)
+        # Note: When resuming, VAE freeze state is restored in load_checkpoint()
+        if (self.use_two_phase or self.vae_freeze_epochs > 0) and self.current_epoch == 0:
             self.freeze_vae()
             if self.use_two_phase:
                 print(f"\n{'='*60}")
@@ -249,7 +320,8 @@ class Trainer:
 
         start_time = time.time()
 
-        for epoch in range(self.num_epochs):
+        # Start from current_epoch (handles resumption correctly)
+        for epoch in range(self.current_epoch, self.num_epochs):
             self.current_epoch = epoch
 
             # Check for phase transition (two-phase training)
@@ -281,8 +353,26 @@ class Trainer:
 
             print(f"Epoch {epoch} - Average loss: {avg_loss:.4f}")
 
-            # Save checkpoint at end of epoch
-            self.save_checkpoint(f'checkpoint_epoch_{epoch}.pt')
+            # Save best checkpoint if this epoch has lowest loss
+            if avg_loss < self.best_loss:
+                self.best_loss = avg_loss
+
+                # Delete previous best checkpoint to save space
+                if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
+                    os.remove(self.best_checkpoint_path)
+                    print(f"  Deleted previous best checkpoint")
+
+                # Save new best checkpoint
+                best_checkpoint_filename = f'checkpoint_best_epoch_{epoch}.pt'
+                self.best_checkpoint_path = self.checkpoint_dir / best_checkpoint_filename
+                self.save_checkpoint(best_checkpoint_filename)
+                print(f"  ✅ New best checkpoint saved! Loss: {avg_loss:.4f}")
+
+            # Also save latest checkpoint (for resuming if training crashes)
+            latest_checkpoint_path = self.checkpoint_dir / 'checkpoint_latest.pt'
+            if os.path.exists(latest_checkpoint_path):
+                os.remove(latest_checkpoint_path)
+            self.save_checkpoint('checkpoint_latest.pt')
 
         # Training complete
         elapsed_time = time.time() - start_time
@@ -301,25 +391,66 @@ class Trainer:
         self.model.save_checkpoint(
             path,
             optimizer=self.optimizer,
+            scheduler=self.scheduler,
             epoch=self.current_epoch,
-            global_step=self.global_step
+            global_step=self.global_step,
+            current_phase=self.current_phase,
+            best_loss=self.best_loss
         )
+
+        # Force garbage collection after checkpoint saving to free RAM
+        gc.collect()
 
     def load_checkpoint(self, path):
         """Load model checkpoint and resume training"""
         print(f"Loading checkpoint from {path}...")
 
-        _, checkpoint = self.model.load_checkpoint(path, self.device)
+        # Load checkpoint and get the loaded model
+        loaded_model, checkpoint = self.model.load_checkpoint(path, self.device)
+
+        # Replace the trainer's model with the loaded model
+        self.model = loaded_model
+        print(f"✓ Model weights loaded successfully")
 
         # Restore optimizer state
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"✓ Optimizer state restored")
+
+        # Restore scheduler state
+        if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print(f"✓ Scheduler state restored")
 
         # Restore training state
         if 'epoch' in checkpoint:
             self.current_epoch = checkpoint['epoch'] + 1
         if 'global_step' in checkpoint:
             self.global_step = checkpoint['global_step']
+        if 'best_loss' in checkpoint:
+            self.best_loss = checkpoint['best_loss']
+            print(f"Restored best loss: {self.best_loss:.4f}")
+
+        # Restore phase state for two-phase training
+        if 'current_phase' in checkpoint:
+            self.current_phase = checkpoint['current_phase']
+            print(f"Restored to phase {self.current_phase}")
+
+            # Set VAE freeze/unfreeze based on restored phase
+            if self.use_two_phase:
+                if self.current_phase == 1:
+                    self.freeze_vae()
+                    print("🔒 VAE frozen (Phase 1)")
+                elif self.current_phase == 2:
+                    self.unfreeze_vae()
+                    print("🔓 VAE unfrozen (Phase 2)")
+        else:
+            # Infer phase from epoch if not saved in checkpoint (backwards compatibility)
+            if self.use_two_phase and self.current_epoch >= self.phase1_epochs:
+                self.current_phase = 2
+                self.unfreeze_vae()
+                print(f"⚠️ Phase not in checkpoint, inferred Phase 2 from epoch {self.current_epoch}")
+                print("🔓 VAE unfrozen")
 
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 

@@ -53,27 +53,32 @@ data:
   dataset_name: 't2ance/APE-data'
   streaming: false  # Download to persistent storage (NOT streaming)
   use_cache: true   # Preprocess once, load cached tensors (FAST!)
-  cache_dir: '/workspace/storage/ape_cache'  # Persistent storage location
+  cache_dir: '/workspace/storage_a100/ape_cache'  # A100 persistent storage location
   force_reprocess: false  # Set to true to regenerate preprocessed cache
   max_samples: null 
 
   # Categories to include
-  categories: ['APE', 'non-APE']  # Use both categories
+  categories: ['APE', 'non APE']  # Use both categories (NOTE: "non APE" has a space!)
 
   # Video settings
-  num_frames: 16  # Number of CT slices per sample - extended temporal context
+  num_frames: 24  # Number of CT slices per sample - extended temporal context
   resolution: [256, 256]  # H, W - higher resolution for better detail (4× more pixels than 128×128)
 
   # CT windowing (for medical imaging)
   window_center: 40  # HU window center for soft tissue
   window_width: 400  # HU window width
 
+  # Train/Val/Test Split (stratified by category)
+  val_split: 0.15  # 15% for validation
+  test_split: 0.10  # 10% for test
+  seed: 42  # Random seed for reproducible splits
+
   # DataLoader settings
-  batch_size: 1  # Must be 1 for 256×256 with 24 frames on V100 32GB
-  num_workers: 2  # Reduced to 2 to prevent RAM exhaustion (was 4)
+  batch_size: 2
+  num_workers: 8
   pin_memory: true
   drop_last: true
-  max_samples: null  # Use full dataset (206 patients) for production training
+  max_samples: null  # Use full dataset (475 patients) for production training
 
 # Training Configuration
 training:
@@ -105,9 +110,9 @@ training:
 
   # Logging
   log_interval: 100  # Log every N steps (reduce overhead)
-  output_dir: '/workspace/storage/outputs'  # Output directory (persistent)
-  log_dir: '/workspace/storage/logs'  # Log directory (persistent)
-  checkpoint_dir: '/workspace/storage/checkpoints'  # Checkpoint directory (persistent)
+  output_dir: '/workspace/storage_a100/outputs'  # A100 output directory
+  log_dir: '/workspace/storage_a100/logs'  # A100 log directory
+  checkpoint_dir: '/workspace/storage_a100/checkpoints'  # A100 checkpoint directory
   experiment_name: 'ape_v2v_diffusion'
 
   # Weights & Biases (optional)
