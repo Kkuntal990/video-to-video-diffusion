@@ -203,13 +203,23 @@ class APECachedDataset(Dataset):
         if corrupted_count > 0:
             print(f"  └─ Skipped {corrupted_count} corrupted cases")
 
-        # Step 2: Download and extract ZIPs
-        print(f"\n[Step 2/4] Downloading and extracting DICOM files...")
-        self._download_and_extract(zip_files)
+        # Step 2: Check if we need to download/extract/preprocess
+        # If all cases are already preprocessed, skip download/extract entirely
+        all_preprocessed = all(
+            (self.processed_dir / f"{Path(zf).stem}.pt").exists()
+            for zf in zip_files
+        )
 
-        # Step 3: Preprocess all cases
-        print(f"\n[Step 3/4] Preprocessing DICOM data...")
-        self._preprocess_all_cases(zip_files)
+        if all_preprocessed and not self.force_reprocess:
+            print(f"\n[Step 2-3/4] ✓ All {len(zip_files)} cases already preprocessed, skipping download/extract/preprocess")
+        else:
+            # Step 2: Download and extract ZIPs
+            print(f"\n[Step 2/4] Downloading and extracting DICOM files...")
+            self._download_and_extract(zip_files)
+
+            # Step 3: Preprocess all cases
+            print(f"\n[Step 3/4] Preprocessing DICOM data...")
+            self._preprocess_all_cases(zip_files)
 
         # Step 4: Load metadata with train/val/test split
         print(f"\n[Step 4/4] Loading metadata and creating {self.split} split...")
