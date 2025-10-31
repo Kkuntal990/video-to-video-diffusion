@@ -109,7 +109,7 @@ def evaluate_test_set(
             patient_ids = batch['patient_id']
 
             # Generate predictions
-            v_pred = model.sample(v_in, num_inference_steps=num_inference_steps)
+            v_pred = model.generate(v_in, sampler='ddim', num_inference_steps=num_inference_steps)
 
             # Calculate metrics for each sample in batch
             for i in range(v_in.size(0)):

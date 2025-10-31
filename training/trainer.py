@@ -270,13 +270,13 @@ class Trainer:
                 loss, metrics = self.model(v_in, v_gt)
 
             # Generate prediction for SSIM/PSNR calculation
-            # Sample from the diffusion model
+            # Sample from the diffusion model using generate() method
             try:
                 if self.use_amp:
                     with autocast():
-                        v_pred = self.model.sample(v_in, num_inference_steps=50)
+                        v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=50)
                 else:
-                    v_pred = self.model.sample(v_in, num_inference_steps=50)
+                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=50)
 
                 # Calculate SSIM and PSNR metrics
                 # Clamp values to [0, 1] range for metric calculation
@@ -287,7 +287,7 @@ class Trainer:
                 psnr_sum += video_metrics['psnr']
                 ssim_sum += video_metrics['ssim']
             except Exception as e:
-                # If sampling fails (e.g., model doesn't have sample method), skip metrics
+                # If sampling fails, skip metrics
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.warning(f"Could not calculate SSIM/PSNR: {e}")
