@@ -20,3 +20,4 @@ transformers>=4.35.0
 safetensors>=0.4.0
 omegaconf>=2.3.0
 pydicom>=2.4.0
+matplotlib>=3.7.0
