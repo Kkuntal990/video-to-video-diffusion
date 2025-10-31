@@ -30,17 +30,30 @@ spec:
           echo ""
 
           # Find the best checkpoint
-          CHECKPOINT_DIR="/workspace/storage_a100/checkpoints"
+          CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/ape_v2v_diffusion"
+
+          # Check if checkpoint directory exists
+          if [ ! -d "$CHECKPOINT_DIR" ]; then
+            echo "ERROR: Checkpoint directory not found: $CHECKPOINT_DIR"
+            echo "Available directories in /workspace/storage_a100/checkpoints:"
+            ls -la /workspace/storage_a100/checkpoints/ || echo "No checkpoints directory found"
+            exit 1
+          fi
 
           # Look for best checkpoint first, otherwise use latest
           if [ -f "$CHECKPOINT_DIR/checkpoint_best.pt" ]; then
             CHECKPOINT="$CHECKPOINT_DIR/checkpoint_best.pt"
             echo "Using best checkpoint: $CHECKPOINT"
-          elif [ -f "$CHECKPOINT_DIR/checkpoint_epoch_*.pt" ]; then
+          elif ls $CHECKPOINT_DIR/checkpoint_best_*.pt 1> /dev/null 2>&1; then
+            CHECKPOINT=$(ls -t $CHECKPOINT_DIR/checkpoint_best_*.pt | head -1)
+            echo "Using best checkpoint with suffix: $CHECKPOINT"
+          elif ls $CHECKPOINT_DIR/checkpoint_epoch_*.pt 1> /dev/null 2>&1; then
             CHECKPOINT=$(ls -t $CHECKPOINT_DIR/checkpoint_epoch_*.pt | head -1)
             echo "Using latest epoch checkpoint: $CHECKPOINT"
           else
             echo "ERROR: No checkpoint found in $CHECKPOINT_DIR"
+            echo "Available files:"
+            ls -la $CHECKPOINT_DIR/
             exit 1
           fi
 
@@ -57,6 +70,7 @@ spec:
           echo ""
           echo "Inference completed!"
           echo "Results saved to: /workspace/storage_a100/inference_results"
+          sleep 1800
 
         resources:
           requests:
