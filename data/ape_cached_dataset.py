@@ -253,8 +253,13 @@ class APECachedDataset(Dataset):
         for zip_file in zip_files:
             case_id = Path(zip_file).stem
             extracted_case_dir = self.extracted_dir / case_id
+            processed_file = self.processed_dir / f"{case_id}.pt"
 
-            # Check if already extracted
+            # Skip if already preprocessed (extracted dirs are deleted after preprocessing)
+            if processed_file.exists() and not self.force_reprocess:
+                continue  # Already preprocessed, no need to download/extract
+
+            # Check if already extracted but not yet preprocessed
             if extracted_case_dir.exists() and not self.force_reprocess:
                 # Verify extraction has files
                 subdirs = list(extracted_case_dir.glob('*/'))
