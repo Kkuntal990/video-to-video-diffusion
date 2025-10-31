@@ -305,6 +305,15 @@ class APECachedDataset(Dataset):
 
     def _preprocess_all_cases(self, zip_files: List[str]):
         """Preprocess all cases and save as .pt files"""
+        import json
+
+        # Load or create metadata cache
+        metadata_file = self.cache_dir / 'metadata.json'
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {}
 
         to_process = []
         for zip_file in zip_files:
@@ -313,9 +322,18 @@ class APECachedDataset(Dataset):
 
             # Check if already processed
             if processed_file.exists() and not self.force_reprocess:
+                # Ensure metadata exists for already-processed files
+                if case_id not in metadata:
+                    category = zip_file.split('/')[0]
+                    metadata[case_id] = category
                 continue
 
             to_process.append((zip_file, case_id))
+
+        # Save metadata for already-processed cases
+        if metadata:
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
 
         if len(to_process) == 0:
             print(f"✓ All {len(zip_files)} cases already preprocessed, skipping")
@@ -350,6 +368,11 @@ class APECachedDataset(Dataset):
                     processed_file = self.processed_dir / f"{case_id}.pt"
                     torch.save(sample_dict, processed_file)
                     successful += 1
+
+                    # Save metadata (category mapping)
+                    metadata[case_id] = category
+                    with open(metadata_file, 'w') as f:
+                        json.dump(metadata, f, indent=2)
 
                     logger.info(f"  ✓ {case_id}: Successfully preprocessed and saved")
 
@@ -574,24 +597,54 @@ class APECachedDataset(Dataset):
             seed: Random seed for reproducible splits
         """
         import random
+        import json
 
-        # Load all samples grouped by category
+        metadata_file = self.cache_dir / 'metadata.json'
+
+        # Load metadata from cache (fast!)
+        if metadata_file.exists():
+            logger.info("Loading metadata from cache...")
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+        else:
+            # Fallback: Generate metadata from existing .pt files (slow, first time only)
+            logger.warning("Metadata cache not found. Generating from .pt files (this may take a while)...")
+            metadata = {}
+            for processed_file in sorted(self.processed_dir.glob('*.pt')):
+                try:
+                    sample = torch.load(processed_file, weights_only=False)
+                    category = sample.get('category', 'unknown')
+                    metadata[processed_file.stem] = category
+                except Exception as e:
+                    logger.warning(f"Failed to load {processed_file} for metadata: {e}")
+                    continue
+
+            # Save generated metadata for next time
+            if metadata:
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                logger.info(f"Saved metadata cache to {metadata_file}")
+
+        if len(metadata) == 0:
+            raise RuntimeError("No preprocessed samples found! Check preprocessing step.")
+
+        # Group samples by category (using sorted keys for deterministic order)
         samples_by_category = {}
-        for processed_file in sorted(self.processed_dir.glob('*.pt')):
-            # Load sample to get category
-            try:
-                sample = torch.load(processed_file, weights_only=False)
-                category = sample.get('category', 'unknown')
+        for case_id in sorted(metadata.keys()):  # SORTED for deterministic splits!
+            category = metadata[case_id]
+            processed_file = self.processed_dir / f"{case_id}.pt"
 
-                if category not in samples_by_category:
-                    samples_by_category[category] = []
-                samples_by_category[category].append(processed_file)
-            except Exception as e:
-                logger.warning(f"Failed to load {processed_file} for split: {e}")
+            # Verify file exists
+            if not processed_file.exists():
+                logger.warning(f"Metadata references {case_id} but file not found, skipping")
                 continue
 
+            if category not in samples_by_category:
+                samples_by_category[category] = []
+            samples_by_category[category].append(processed_file)
+
         if len(samples_by_category) == 0:
-            raise RuntimeError("No preprocessed samples found! Check preprocessing step.")
+            raise RuntimeError("No valid samples found after metadata loading!")
 
         # Perform stratified split (balanced by category)
         self.samples = []
@@ -603,7 +656,9 @@ class APECachedDataset(Dataset):
 
         logger.info(f"Creating {split} split with {val_split*100:.0f}% val, {test_split*100:.0f}% test")
 
-        for category, category_samples in samples_by_category.items():
+        # Iterate categories in sorted order for deterministic splits across runs
+        for category in sorted(samples_by_category.keys()):
+            category_samples = samples_by_category[category]
             n_samples = len(category_samples)
             n_val = int(n_samples * val_split)
             n_test = int(n_samples * test_split)
