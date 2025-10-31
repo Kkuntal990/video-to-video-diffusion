@@ -63,6 +63,7 @@ class Trainer:
 
         # Training settings
         self.num_epochs = self.config.get('num_epochs', 100)
+        self.model_suffix = self.config.get('model_suffix', '')  # Optional suffix for multi-model training
 
         # Two-phase training settings
         self.use_two_phase = self.pretrained_config.get('two_phase_training', False)
@@ -108,10 +109,30 @@ class Trainer:
         print(f"Trainer initialized:")
         print(f"  Device: {device}")
         print(f"  Num epochs: {self.num_epochs}")
+        print(f"  Model suffix: {self.model_suffix if self.model_suffix else 'None'}")
         print(f"  Gradient accumulation: {self.gradient_accumulation_steps}")
         print(f"  Mixed precision: {self.use_amp}")
         print(f"  Log dir: {self.log_dir}")
         print(f"  Checkpoint dir: {self.checkpoint_dir}")
+
+    def _get_checkpoint_filename(self, base_name):
+        """
+        Generate checkpoint filename with model suffix
+
+        Args:
+            base_name: Base filename (e.g., 'checkpoint_best_epoch_10.pt')
+
+        Returns:
+            Filename with suffix (e.g., 'checkpoint_best_epoch_10_pretrained.pt')
+        """
+        if not self.model_suffix:
+            return base_name
+
+        # Insert suffix before .pt extension
+        if base_name.endswith('.pt'):
+            return base_name[:-3] + f'_{self.model_suffix}.pt'
+        else:
+            return f'{base_name}_{self.model_suffix}'
 
     def freeze_vae(self):
         """Freeze VAE parameters (encoder and decoder)"""
@@ -205,7 +226,8 @@ class Trainer:
 
             # Save checkpoint
             if self.global_step % self.checkpoint_interval == 0:
-                self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
+                step_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_step_{self.global_step}.pt')
+                self.save_checkpoint(step_checkpoint_filename)
 
         # Average epoch loss (convert to scalar only once at end of epoch)
         if epoch_loss_count > 0:
@@ -363,23 +385,26 @@ class Trainer:
                     print(f"  Deleted previous best checkpoint")
 
                 # Save new best checkpoint
-                best_checkpoint_filename = f'checkpoint_best_epoch_{epoch}.pt'
+                best_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_best_epoch_{epoch}.pt')
                 self.best_checkpoint_path = self.checkpoint_dir / best_checkpoint_filename
                 self.save_checkpoint(best_checkpoint_filename)
-                print(f"  ✅ New best checkpoint saved! Loss: {avg_loss:.4f}")
+                print(f"  ✅ New best checkpoint saved: {best_checkpoint_filename} (Loss: {avg_loss:.4f})")
 
             # Also save latest checkpoint (for resuming if training crashes)
-            latest_checkpoint_path = self.checkpoint_dir / 'checkpoint_latest.pt'
+            latest_checkpoint_filename = self._get_checkpoint_filename('checkpoint_latest.pt')
+            latest_checkpoint_path = self.checkpoint_dir / latest_checkpoint_filename
             if os.path.exists(latest_checkpoint_path):
                 os.remove(latest_checkpoint_path)
-            self.save_checkpoint('checkpoint_latest.pt')
+            self.save_checkpoint(latest_checkpoint_filename)
 
         # Training complete
         elapsed_time = time.time() - start_time
         print(f"\nTraining complete! Total time: {elapsed_time / 3600:.2f} hours")
 
         # Save final checkpoint
-        self.save_checkpoint('checkpoint_final.pt')
+        final_checkpoint_filename = self._get_checkpoint_filename('checkpoint_final.pt')
+        self.save_checkpoint(final_checkpoint_filename)
+        print(f"Final checkpoint saved: {final_checkpoint_filename}")
 
         # Close writer
         self.writer.close()

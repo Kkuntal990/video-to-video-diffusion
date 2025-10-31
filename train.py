@@ -201,8 +201,19 @@ def main(args):
         trainer.load_checkpoint(args.resume)
     else:
         # Auto-detect best checkpoint in checkpoint directory
+        # If model_suffix is specified, look for checkpoints with that suffix
         checkpoint_dir_path = Path(checkpoint_dir)
-        best_checkpoints = list(checkpoint_dir_path.glob('checkpoint_best_*.pt'))
+        model_suffix = config['training'].get('model_suffix', '')
+
+        if model_suffix:
+            # Look for checkpoints with this specific suffix
+            pattern = f'checkpoint_best_*_{model_suffix}.pt'
+            logger.info(f"Looking for checkpoints with suffix: {model_suffix}")
+        else:
+            # Look for any best checkpoint
+            pattern = 'checkpoint_best_*.pt'
+
+        best_checkpoints = list(checkpoint_dir_path.glob(pattern))
         if best_checkpoints:
             # Find the best checkpoint (most recent if multiple)
             best_checkpoint = max(best_checkpoints, key=lambda p: p.stat().st_mtime)

@@ -86,6 +86,11 @@ training:
   learning_rate: 0.0001  # 1e-4
   weight_decay: 0.01
 
+  # Model identification (for managing multiple model variants)
+  model_suffix: 'pretrained_sd_vae'  # Suffix added to checkpoint names (e.g., checkpoint_best_epoch_10_pretrained_sd_vae.pt)
+                                      # Leave empty or remove for no suffix
+                                      # Examples: 'pretrained_sd_vae', 'scratch', 'opensora_vae', 'v2', etc.
+
   # Optimization
   optimizer: 'adamw'  # 'adam' or 'adamw'
   gradient_accumulation_steps: 16  # Simulate batch_size=16 (actual batch=1)
