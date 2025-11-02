@@ -52,8 +52,8 @@ class APEDataset(Dataset):
         extract_dir: Optional[str] = None,
         cache_extracted: bool = True,
         normalize: bool = True,
-        window_center: int = 40,  # HU window center for soft tissue
-        window_width: int = 400,  # HU window width
+        window_center: int = 200,  # HU window center for pulmonary/vascular imaging
+        window_width: int = 1800,  # HU window width for lung+vessels (range: -700 to 1100 HU)
     ):
         """
         Args:
@@ -211,20 +211,20 @@ class APEDataset(Dataset):
 
     def _apply_ct_windowing(self, volume: np.ndarray) -> np.ndarray:
         """
-        Apply CT windowing to convert HU values to display range
+        Apply CT windowing to convert HU values to normalized range
 
         Args:
             volume: CT volume in Hounsfield Units
 
         Returns:
-            windowed_volume: Values in range [0, 255]
+            windowed_volume: Float32 values in range [0, 1]
         """
         lower = self.window_center - (self.window_width / 2)
         upper = self.window_center + (self.window_width / 2)
 
-        # Clip and normalize
+        # Clip and normalize to [0, 1] (keep as float for precision)
         windowed = np.clip(volume, lower, upper)
-        windowed = ((windowed - lower) / (upper - lower) * 255).astype(np.uint8)
+        windowed = ((windowed - lower) / (upper - lower)).astype(np.float32)
 
         return windowed
 
@@ -319,13 +319,14 @@ class APEDataset(Dataset):
         baseline_sampled = self._sample_frames(baseline_volume)  # (T, H, W)
         followup_sampled = self._sample_frames(followup_volume)  # (T, H, W)
 
-        # Convert grayscale to RGB (repeat channel 3 times)
-        baseline_rgb = np.stack([baseline_sampled] * 3, axis=-1)  # (T, H, W, 3)
-        followup_rgb = np.stack([followup_sampled] * 3, axis=-1)  # (T, H, W, 3)
+        # Keep as grayscale (1 channel) for medical imaging
+        # Medical VAEs (like NVIDIA MAISI) expect single-channel CT input
+        baseline_gray = baseline_sampled[:, :, :, np.newaxis]  # (T, H, W, 1)
+        followup_gray = followup_sampled[:, :, :, np.newaxis]  # (T, H, W, 1)
 
         # Apply transforms (resize and normalize to [-1, 1])
-        input_tensor = self.transform(baseline_rgb)
-        target_tensor = self.transform(followup_rgb)
+        input_tensor = self.transform(baseline_gray)
+        target_tensor = self.transform(followup_gray)
 
         # Cleanup if not caching
         if not self.cache_extracted and patient_dir.exists():

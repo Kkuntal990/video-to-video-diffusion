@@ -45,23 +45,49 @@ class VideoToVideoDiffusion(nn.Module):
         # VAE for encoding/decoding videos
         if use_pretrained and pretrained_config.get('vae', {}).get('enabled', False):
             vae_config = pretrained_config['vae']
-            print(f"Loading pretrained VAE from {vae_config['model_name']}...")
-            self.vae = VideoVAE.from_pretrained(
-                vae_config['model_name'],
-                method=vae_config.get('method', 'auto'),
-                inflate_method=vae_config.get('inflate_method', 'central'),
-                device='cpu'  # Will be moved to correct device later
-            )
+
+            # Check if using MAISI VAE (medical imaging specific)
+            if vae_config.get('use_maisi', False):
+                print(f"Loading NVIDIA MAISI VAE for medical CT imaging...")
+                self.vae = VideoVAE(
+                    in_channels=config.get('in_channels', 1),  # Grayscale for medical
+                    latent_dim=4,  # MAISI uses 4 latent channels (verified from checkpoint)
+                    use_maisi=True,
+                    maisi_checkpoint=vae_config.get('checkpoint_path', None)
+                )
+            else:
+                # Load other pretrained VAE (SD VAE, etc.)
+                print(f"Loading pretrained VAE from {vae_config['model_name']}...")
+                self.vae = VideoVAE.from_pretrained(
+                    vae_config['model_name'],
+                    method=vae_config.get('method', 'auto'),
+                    inflate_method=vae_config.get('inflate_method', 'central'),
+                    device='cpu'  # Will be moved to correct device later
+                )
         else:
+            # Train VAE from scratch
+            # Check if using MAISI-like architecture (grayscale + specific channel config)
+            model_config = config.get('model', config)  # Handle nested model key
+            in_channels = model_config.get('in_channels', config.get('in_channels', 3))
+            base_channels = model_config.get('vae_base_channels', config.get('vae_base_channels', 64))
+            latent_dim = model_config.get('latent_dim', config.get('latent_dim', 4))
+            scaling_factor = model_config.get('vae_scaling_factor', config.get('vae_scaling_factor', 0.18215))
+
+            use_maisi_arch = (in_channels == 1 and base_channels == 64)  # MAISI pattern
+
             self.vae = VideoVAE(
-                in_channels=config.get('in_channels', 3),
-                latent_dim=config.get('latent_dim', 4),
-                base_channels=config.get('vae_base_channels', 64)
+                in_channels=in_channels,
+                latent_dim=latent_dim,
+                base_channels=base_channels,
+                scaling_factor=scaling_factor,
+                use_maisi_arch=use_maisi_arch  # Use MAISI architecture without pretrained weights
             )
 
         # U-Net for denoising
+        # Use latent_dim from VAE (3 for MAISI, 4 for custom)
+        actual_latent_dim = self.vae.latent_dim
         self.unet = UNet3D(
-            latent_dim=config.get('latent_dim', 4),
+            latent_dim=actual_latent_dim,
             model_channels=config.get('unet_model_channels', 128),
             num_res_blocks=config.get('unet_num_res_blocks', 2),
             attention_levels=config.get('unet_attention_levels', [1, 2]),
@@ -130,12 +156,21 @@ class VideoToVideoDiffusion(nn.Module):
         z_in = self.vae.encode(v_in)  # Conditioning
         z_gt = self.vae.encode(v_gt)  # Target for diffusion
 
-        # Compute diffusion loss
-        loss = self.diffusion.training_loss(self.unet, z_gt, z_in)
+        # Compute diffusion loss (with optional MS-SSIM)
+        # Note: use_ssim and ssim_weight should be set in config
+        # For now, defaulting to MSE only to maintain backward compatibility
+        loss, loss_dict = self.diffusion.training_loss(
+            self.unet, z_gt, z_in,
+            vae=self.vae,
+            v_gt=v_gt,
+            use_ssim=False,  # Can be enabled via config
+            ssim_weight=0.0   # Can be set via config (e.g., 0.2)
+        )
 
-        # Additional metrics (optional)
+        # Additional metrics
         metrics = {
-            'loss': loss.item()
+            'loss': loss.item(),
+            **loss_dict  # Include individual loss components
         }
 
         return loss, metrics

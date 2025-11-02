@@ -209,31 +209,285 @@ class VideoVAE(nn.Module):
     Input/Output format: (B, C, T, H, W)
     """
 
-    def __init__(self, in_channels=3, latent_dim=4, base_channels=64):
+    def __init__(self, in_channels=3, latent_dim=4, base_channels=64, scaling_factor=0.18215,
+                 use_maisi=False, maisi_checkpoint=None, use_maisi_arch=False):
         super().__init__()
-        self.encoder = VideoEncoder(in_channels, latent_dim, base_channels)
-        self.decoder = VideoDecoder(latent_dim, in_channels, base_channels)
+
+        self.use_maisi = (use_maisi and maisi_checkpoint is not None)  # Only True if loading pretrained MAISI
+        self.use_maisi_arch = use_maisi_arch  # Using MAISI-like architecture (but 2D, not 3D)
         self.latent_dim = latent_dim
+        self.in_channels = in_channels
+
+        if self.use_maisi:
+            # Load pretrained MAISI VAE (3D volumetric)
+            print("Initializing MAISI VAE with pretrained weights...")
+            self._load_maisi_vae(maisi_checkpoint)
+            self.scaling_factor = 1.0  # MAISI has built-in scaling
+        elif use_maisi_arch:
+            # Use MAISI-inspired 2D architecture (grayscale, medical imaging optimized)
+            print("Initializing MAISI-inspired 2D architecture (grayscale, training from scratch)...")
+            # Use our 2D+time VideoEncoder/VideoDecoder with MAISI-like depth
+            # Channels progression: 64 → 128 → 256 → 256 (3-level like MAISI)
+            self.encoder = VideoEncoder(in_channels, latent_dim, base_channels)
+            self.decoder = VideoDecoder(latent_dim, in_channels, base_channels)
+            self.scaling_factor = scaling_factor
+            print(f"✓ Initialized MAISI-inspired 2D VAE (medical imaging optimized)")
+            print(f"  Architecture: 3-level encoder/decoder ({base_channels}→{base_channels*2}→{base_channels*4})")
+            print(f"  Grayscale input: {in_channels} channel(s)")
+            print(f"  Latent dim: {latent_dim}")
+            print(f"  Scaling factor: {scaling_factor}")
+        else:
+            # Use custom VideoVAE architecture
+            self.encoder = VideoEncoder(in_channels, latent_dim, base_channels)
+            self.decoder = VideoDecoder(latent_dim, in_channels, base_channels)
+
+            # Scaling factor for latent space normalization
+            # Standard SD VAE uses 0.18215, but this should be calculated from your dataset
+            # To calculate: scale = 1 / std(latent_activations)
+            self.scaling_factor = scaling_factor
+
+    def _load_maisi_vae(self, checkpoint_path):
+        """
+        Load NVIDIA MAISI VAE for medical CT imaging
+
+        Args:
+            checkpoint_path: Path to MAISI VAE checkpoint
+        """
+        try:
+            from monai.networks.nets import AutoencoderKL
+            print("Loading MAISI VAE from MONAI...")
+
+            # MAISI VAE configuration (3D AutoencoderKL)
+            # Based on actual MAISI model: 3-level architecture 64→128→256
+            self.maisi_vae = AutoencoderKL(
+                spatial_dims=3,
+                in_channels=1,  # Grayscale CT
+                out_channels=1,
+                channels=(64, 128, 256),  # 3-level progression: 64→128→256
+                latent_channels=4,  # MAISI uses 4 latent channels
+                num_res_blocks=(2, 2, 2),  # 2 residual blocks per level
+                attention_levels=(False, False, True),  # Attention at deepest level only
+                with_encoder_nonlocal_attn=True,
+                with_decoder_nonlocal_attn=True,
+            )
+
+            # Update latent_dim to match MAISI
+            self.latent_dim = 4
+
+            # Load checkpoint if provided
+            if checkpoint_path is not None:
+                from pathlib import Path
+                checkpoint_path = Path(checkpoint_path)
+
+                if not checkpoint_path.exists():
+                    print(f"Warning: MAISI checkpoint not found at {checkpoint_path}")
+                    print("Using randomly initialized MAISI architecture (will need training)")
+                else:
+                    print(f"Loading MAISI weights from {checkpoint_path}")
+                    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+                    # Handle different checkpoint formats
+                    if isinstance(checkpoint, dict):
+                        if 'state_dict' in checkpoint:
+                            state_dict = checkpoint['state_dict']
+                        elif 'model' in checkpoint:
+                            state_dict = checkpoint['model']
+                        else:
+                            state_dict = checkpoint
+                    else:
+                        state_dict = checkpoint
+
+                    # Load state dict with manual filtering for incompatible shapes
+                    model_state = self.maisi_vae.state_dict()
+                    filtered_state = {}
+                    incompatible_keys = []
+
+                    for key, param in state_dict.items():
+                        if key in model_state:
+                            if param.shape == model_state[key].shape:
+                                filtered_state[key] = param
+                            else:
+                                incompatible_keys.append(
+                                    f"{key}: checkpoint{list(param.shape)} vs model{list(model_state[key].shape)}"
+                                )
+                        # else: key not in model (will be handled by load_state_dict)
+
+                    # Load only compatible weights
+                    missing_keys, unexpected_keys = self.maisi_vae.load_state_dict(filtered_state, strict=False)
+
+                    # Report loading status
+                    loaded_keys = len(filtered_state)
+                    total_model_keys = len(model_state)
+
+                    print(f"✓ Loaded {loaded_keys}/{total_model_keys} compatible weights from MAISI checkpoint")
+                    if incompatible_keys:
+                        print(f"  ⚠ Skipped {len(incompatible_keys)} incompatible keys (shape mismatch)")
+                        if len(incompatible_keys) <= 5:
+                            for key_info in incompatible_keys:
+                                print(f"    - {key_info}")
+                    if missing_keys:
+                        print(f"  ℹ {len(missing_keys)} keys initialized randomly (not in checkpoint)")
+                    if unexpected_keys:
+                        print(f"  ℹ {len(unexpected_keys)} unexpected keys in checkpoint (ignored)")
+
+        except ImportError:
+            raise ImportError(
+                "MONAI is required for MAISI VAE. Install with: pip install 'monai[all]>=1.4.0'"
+            )
+
+    def _init_maisi_architecture(self):
+        """
+        Initialize MAISI-like architecture without loading pretrained weights.
+        This creates the same medical imaging optimized architecture but trains from scratch.
+        """
+        try:
+            from monai.networks.nets import AutoencoderKL
+
+            # MAISI VAE configuration (3D AutoencoderKL for medical imaging)
+            # - Grayscale input (1 channel)
+            # - 3D convolutions (process each frame as D=1 depth)
+            # - 3-level encoder/decoder: channels=(64, 128, 256)
+            # - Latent channels: 4 (standard for diffusion)
+            self.maisi_vae = AutoencoderKL(
+                spatial_dims=3,
+                in_channels=1,  # Grayscale CT scans
+                out_channels=1,
+                channels=(64, 128, 256),  # 3-level progression (MAISI-like)
+                latent_channels=4,  # Standard for diffusion models
+                num_res_blocks=(2, 2, 2),  # 2 residual blocks per level
+                attention_levels=(False, False, True),  # Attention only at deepest level
+                with_encoder_nonlocal_attn=True,  # Global attention in encoder
+                with_decoder_nonlocal_attn=True,  # Global attention in decoder
+            )
+
+            self.latent_dim = 4
+            print(f"✓ Initialized MAISI-like architecture (grayscale, medical imaging optimized)")
+            print(f"  Architecture: 3-level VAE with channels (64→128→256)")
+            print(f"  Latent dim: {self.latent_dim}")
+            print(f"  Training from scratch (no pretrained weights)")
+
+        except ImportError:
+            raise ImportError(
+                "MONAI is required for MAISI architecture. Install with: pip install 'monai[all]>=1.4.0'"
+            )
 
     def encode(self, x):
         """
-        Encode video to latent space
+        Encode video to latent space with scaling
         Args:
-            x: (B, C, T, H, W) video tensor
+            x: (B, C, T, H, W) video tensor in range [-1, 1]
+               C=1 for MAISI (grayscale), C=3 for custom VAE (RGB)
         Returns:
-            z: (B, latent_dim, T, h, w) latent tensor
+            z: (B, latent_dim, T, h, w) scaled latent tensor
         """
-        return self.encoder(x)
+        if self.use_maisi:
+            return self._encode_with_maisi(x)
+        else:
+            z = self.encoder(x)
+            # Scale latents to normalize magnitude for diffusion
+            z = z * self.scaling_factor
+            return z
 
     def decode(self, z):
         """
-        Decode latent to video
+        Decode latent to video with unscaling
         Args:
-            z: (B, latent_dim, T, h, w) latent tensor
+            z: (B, latent_dim, T, h, w) scaled latent tensor
         Returns:
-            x: (B, C, T, H, W) reconstructed video
+            x: (B, C, T, H, W) reconstructed video in range [-1, 1]
+               C=1 for MAISI (grayscale), C=3 for custom VAE (RGB)
         """
-        return self.decoder(z)
+        if self.use_maisi:
+            return self._decode_with_maisi(z)
+        else:
+            # Unscale latents before decoding
+            z = z / self.scaling_factor
+            return self.decoder(z)
+
+    def _encode_with_maisi(self, x):
+        """
+        Encode video using MAISI VAE
+
+        Args:
+            x: (B, C, T, H, W) video tensor, C should be 1 for grayscale
+        Returns:
+            z: (B, latent_dim, T, H//8, W//8) latent tensor
+        """
+        B, C, T, H, W = x.shape
+
+        # Ensure single channel (MAISI expects grayscale)
+        if C != 1:
+            raise ValueError(f"MAISI VAE expects 1-channel grayscale input, got {C} channels")
+
+        # Process each frame through MAISI 3D VAE
+        # MAISI processes 3D volumes, so we treat each video frame as a thin 3D volume
+        latents = []
+        for t in range(T):
+            # Extract single frame: (B, 1, 1, H, W) - treat as thin 3D volume (D=1)
+            frame_3d = x[:, :, t:t+1, :, :]
+
+            # Encode through MAISI VAE
+            # MAISI returns latent distribution, we use the mean (deterministic)
+            z_dist = self.maisi_vae.encode(frame_3d)
+            if hasattr(z_dist, 'sample'):
+                # If it's a distribution, sample from it
+                z_t = z_dist.sample()
+            elif isinstance(z_dist, tuple):
+                # Some implementations return (mean, logvar)
+                z_t = z_dist[0]
+            else:
+                # Direct latent output
+                z_t = z_dist
+
+            # z_t shape: (B, latent_channels, 1, H//8, W//8)
+            # Squeeze the depth dimension
+            z_t = z_t.squeeze(2)  # (B, latent_channels, H//8, W//8)
+
+            latents.append(z_t)
+
+        # Stack along temporal dimension
+        z = torch.stack(latents, dim=2)  # (B, latent_dim, T, H//8, W//8)
+
+        # Apply scaling factor (typically 1.0 for MAISI)
+        z = z * self.scaling_factor
+
+        return z
+
+    def _decode_with_maisi(self, z):
+        """
+        Decode latent using MAISI VAE
+
+        Args:
+            z: (B, latent_dim, T, H//8, W//8) latent tensor
+        Returns:
+            x: (B, 1, T, H, W) reconstructed video tensor
+        """
+        # Unscale latents
+        z = z / self.scaling_factor
+
+        B, C, T, H, W = z.shape
+
+        # Decode each frame through MAISI VAE
+        frames = []
+        for t in range(T):
+            # Extract latent for this frame: (B, C, H, W)
+            z_t = z[:, :, t, :, :]
+
+            # Add depth dimension for 3D VAE: (B, C, 1, H, W)
+            z_t_3d = z_t.unsqueeze(2)
+
+            # Decode through MAISI VAE
+            frame_3d = self.maisi_vae.decode(z_t_3d)  # (B, 1, 1, H*8, W*8)
+
+            # Squeeze depth dimension
+            frame = frame_3d.squeeze(2)  # (B, 1, H*8, W*8)
+
+            frames.append(frame)
+
+        # Stack along temporal dimension
+        x = torch.stack(frames, dim=2)  # (B, 1, T, H*8, W*8)
+
+        return x
 
     def forward(self, x):
         """

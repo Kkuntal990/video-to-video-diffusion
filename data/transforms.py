@@ -19,8 +19,9 @@ class VideoTransform:
     """
     Transform for video data
 
-    Input: numpy array of shape (T, H, W, 3) in [0, 255]
-    Output: torch tensor of shape (3, T, H, W) in [-1, 1]
+    Input: numpy array of shape (T, H, W, C) where C=1 (grayscale) or C=3 (RGB)
+           Values in [0, 1] (float32) or [0, 255] (uint8)
+    Output: torch tensor of shape (C, T, H, W) in [-1, 1]
     """
 
     def __init__(self, resolution=(256, 256), num_frames=16, normalize=True):
@@ -39,11 +40,13 @@ class VideoTransform:
         Apply transforms to video frames
 
         Args:
-            frames: numpy array (T, H, W, 3) in [0, 255]
+            frames: numpy array (T, H, W, C) in [0, 1] (float32) or [0, 255] (uint8)
+                   where C=1 (grayscale, medical imaging) or C=3 (RGB, natural images)
                    NOTE: Frame sampling should already be done in dataset!
 
         Returns:
-            video: torch tensor (3, T, H, W) in [-1, 1]
+            video: torch tensor (C, T, H, W) in [-1, 1]
+                  C=1 for grayscale (medical VAE), C=3 for RGB
         """
         # Frame sampling removed - already done in APEHuggingFaceDataset._sample_frames()
         # This eliminates redundant sampling and improves performance
@@ -67,7 +70,13 @@ class VideoTransform:
 
         # Normalize to [-1, 1]
         if self.normalize:
-            video = video / 127.5 - 1.0
+            # Check if input is in [0, 255] range (uint8) or [0, 1] range (float32)
+            if frames.dtype == np.uint8 or video.max() > 1.1:
+                # Input is in [0, 255] range
+                video = video / 127.5 - 1.0
+            else:
+                # Input is already in [0, 1] range (from CT windowing)
+                video = video * 2.0 - 1.0
 
         return video
 

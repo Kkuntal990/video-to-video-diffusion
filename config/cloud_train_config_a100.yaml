@@ -1,11 +1,12 @@
 # Cloud Training Configuration for APE-Data
-# This config uses HuggingFace streaming to download the full dataset
+# Custom Grayscale VAE with MAISI-like Architecture (trained from scratch)
 
 # Model Configuration
 model:
-  in_channels: 3
-  latent_dim: 4  # Match SD VAE latent dimension (4 channels)
-  vae_base_channels: 128  # Match SD VAE base channels (128)
+  in_channels: 1  # Grayscale CT scans (medical imaging)
+  latent_dim: 4  # MAISI-like latent channels (medical imaging standard)
+  vae_base_channels: 64  # MAISI architecture: channels=(64, 128, 256)
+  vae_scaling_factor: 0.18215  # Standard latent scaling for diffusion models
   unet_model_channels: 128
   unet_num_res_blocks: 2
   unet_attention_levels: [1, 2]
@@ -18,30 +19,31 @@ model:
   beta_end: 0.02
 
 # Pretrained Weights Configuration
-# Using Stable Diffusion VAE pretrained weights
-# - SD VAE weights are inflated from 2D to 3D using 'central' method
-# - Architecture matches: both use [128, 256, 512, 512] channel progression
-# - Latent dim: 4 (matches SD VAE)
+# Using CUSTOM GRAYSCALE VAE - Trained from scratch
+# - Native grayscale (1 channel) for CT scans (3× memory savings)
+# - Optimized for medical CT intensity distributions
+# - Proper latent scaling (0.18215) for diffusion
+# - Architecture designed for 2D+time videos
+# Decision: MAISI VAE incompatible (3D volumetric vs 2D+time), SD VAE has domain gap
 pretrained:
-  use_pretrained: true  # ENABLED - Load SD VAE pretrained weights
+  use_pretrained: false  # DISABLED - Train VAE from scratch (grayscale-optimized)
 
-  # VAE pretrained weights
+  # VAE pretrained weights (DISABLED)
   vae:
-    enabled: true  # Load pretrained SD VAE encoder/decoder
-    model_name: 'stabilityai/sd-vae-ft-mse'  # Stable Diffusion fine-tuned VAE
-    method: 'auto'  # Auto-detect SD VAE
-    inflate_method: 'central'  # Inflate 2D->3D weights (central initialization)
-    freeze_epochs: 5  # Freeze VAE for first 5 epochs while U-Net learns
+    enabled: false  # Train custom grayscale VAE from scratch
+    use_maisi: false  # MAISI incompatible with 2D+time video approach
+    checkpoint_path: null  # No pretrained weights
+    freeze_epochs: 0  # Train VAE and U-Net jointly from start
 
-  # Training strategy
-  two_phase_training: true
-  phase1_epochs: 5  # Phase 1: Freeze VAE and train U-Net for 5 epochs (~30 hours)
-  # Phase 2: Fine-tune entire model for remaining 45 epochs (~270 hours)
+  # Training strategy (single-phase, joint training)
+  two_phase_training: false  # Train VAE + U-Net together from epoch 1
+  phase1_epochs: 0  # No separate VAE freezing phase
+  # Single-phase training: Full model for all 50 epochs
 
-  # Layer-wise learning rates
+  # Layer-wise learning rates (uniform, no pretrained weights)
   layer_lr_multipliers:
-    vae_encoder: 0.1
-    vae_decoder: 0.1
+    vae_encoder: 1.0  # Same LR as U-Net
+    vae_decoder: 1.0  # Same LR as U-Net
     unet: 1.0
 
 # Data Configuration - HuggingFace with Caching
@@ -65,8 +67,8 @@ data:
   resolution: [256, 256]  # H, W - higher resolution for better detail (4× more pixels than 128×128)
 
   # CT windowing (for medical imaging)
-  window_center: 40  # HU window center for soft tissue
-  window_width: 400  # HU window width
+  window_center: 200  # HU window center for pulmonary/vascular imaging
+  window_width: 1800  # HU window width for lung+vessels (range: -700 to 1100 HU)
 
   # Train/Val/Test Split (stratified by category)
   val_split: 0.15  # 15% for validation
@@ -87,9 +89,9 @@ training:
   weight_decay: 0.01
 
   # Model identification (for managing multiple model variants)
-  model_suffix: 'pretrained_sd_vae'  # Suffix added to checkpoint names (e.g., checkpoint_best_epoch_10_pretrained_sd_vae.pt)
-                                      # Leave empty or remove for no suffix
-                                      # Examples: 'pretrained_sd_vae', 'scratch', 'opensora_vae', 'v2', etc.
+  model_suffix: 'maisi_arch_scratch'  # Suffix: MAISI-like architecture, trained from scratch
+                                       # (checkpoint_best_epoch_10_maisi_arch_scratch.pt)
+                                       # Indicates grayscale VAE with medical imaging architecture
 
   # Optimization
   optimizer: 'adamw'  # 'adam' or 'adamw'

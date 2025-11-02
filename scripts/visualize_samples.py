@@ -47,15 +47,21 @@ def tensor_to_image(tensor):
 
     Args:
         tensor: (C, H, W) tensor in range [0, 1]
+               C=1 for grayscale (medical imaging), C=3 for RGB
 
     Returns:
         image: (H, W, C) numpy array in range [0, 255]
+               For grayscale, C=3 (repeated for visualization)
     """
     # Clamp to [0, 1]
     tensor = torch.clamp(tensor, 0, 1)
 
     # Convert to numpy: (C, H, W) -> (H, W, C)
     image = tensor.cpu().numpy().transpose(1, 2, 0)
+
+    # If grayscale (C=1), repeat to RGB for visualization
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)  # (H, W, 1) -> (H, W, 3)
 
     # Convert to [0, 255]
     image = (image * 255).astype(np.uint8)

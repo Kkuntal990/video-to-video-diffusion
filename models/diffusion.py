@@ -105,19 +105,24 @@ class GaussianDiffusion(nn.Module):
 
         return z_t, noise
 
-    def training_loss(self, model, z_0, c):
+    def training_loss(self, model, z_0, c, vae=None, v_gt=None, use_ssim=False, ssim_weight=0.0):
         """
         Compute training loss for the denoising model
 
-        L = E[||epsilon - epsilon_theta(z_t, t, c)||^2]
+        L = (1-λ) * E[||epsilon - epsilon_theta(z_t, t, c)||^2] + λ * L_SSIM
 
         Args:
             model: denoising model (epsilon_theta)
             z_0: clean latent (B, C, T, H, W)
             c: conditioning latent (B, C, T, H, W)
+            vae: VAE model for decoding (optional, for SSIM loss)
+            v_gt: ground truth video (optional, for SSIM loss)
+            use_ssim: whether to use MS-SSIM loss component
+            ssim_weight: weight for SSIM loss (default 0.0 = MSE only)
 
         Returns:
-            loss: MSE loss
+            loss: Combined loss (MSE + optional MS-SSIM)
+            loss_dict: Dictionary with individual loss components
         """
         B = z_0.shape[0]
         device = z_0.device
@@ -134,10 +139,77 @@ class GaussianDiffusion(nn.Module):
         # Predict noise
         noise_pred = model(z_t, t, c)
 
-        # Compute loss (simple MSE)
-        loss = F.mse_loss(noise_pred, noise)
+        # Compute MSE loss (base diffusion loss)
+        loss_mse = F.mse_loss(noise_pred, noise)
 
-        return loss
+        # Initialize loss dict
+        loss_dict = {'mse': loss_mse.item()}
+
+        # Optionally add MS-SSIM loss on reconstructed videos
+        if use_ssim and ssim_weight > 0.0 and vae is not None and v_gt is not None:
+            try:
+                from pytorch_msssim import ms_ssim
+
+                # Predict clean latent (denoise)
+                z_0_pred = self._predict_z_0_from_noise(z_t, t, noise_pred)
+
+                # Decode to video space
+                with torch.no_grad():
+                    v_pred = vae.decode(z_0_pred)
+
+                # Compute MS-SSIM loss
+                # MS-SSIM works on 4D tensors, so we process each frame
+                ssim_losses = []
+                B, C, T, H, W = v_gt.shape
+                for i in range(T):
+                    frame_gt = v_gt[:, :, i, :, :]  # (B, C, H, W)
+                    frame_pred = v_pred[:, :, i, :, :]  # (B, C, H, W)
+
+                    # MS-SSIM expects values in [0, 1], but we have [-1, 1]
+                    frame_gt_norm = (frame_gt + 1.0) / 2.0
+                    frame_pred_norm = (frame_pred + 1.0) / 2.0
+
+                    ssim_val = ms_ssim(frame_pred_norm, frame_gt_norm, data_range=1.0, size_average=True)
+                    ssim_losses.append(1.0 - ssim_val)  # Convert to loss (lower is better)
+
+                loss_ssim = torch.stack(ssim_losses).mean()
+                loss_dict['ssim'] = loss_ssim.item()
+
+                # Combined loss
+                total_loss = (1.0 - ssim_weight) * loss_mse + ssim_weight * loss_ssim
+                loss_dict['total'] = total_loss.item()
+
+                return total_loss, loss_dict
+
+            except ImportError:
+                print("Warning: pytorch-msssim not installed. Falling back to MSE-only loss.")
+            except Exception as e:
+                print(f"Warning: MS-SSIM calculation failed: {e}. Using MSE-only loss.")
+
+        # If no SSIM, return MSE only
+        loss_dict['total'] = loss_mse.item()
+        return loss_mse, loss_dict
+
+    def _predict_z_0_from_noise(self, z_t, t, noise_pred):
+        """
+        Predict clean latent z_0 from noisy latent z_t and predicted noise
+
+        z_0 = (z_t - sqrt(1-alpha_cumprod) * noise) / sqrt(alpha_cumprod)
+
+        Args:
+            z_t: noisy latent
+            t: timestep
+            noise_pred: predicted noise
+
+        Returns:
+            z_0_pred: predicted clean latent
+        """
+        sqrt_alpha_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, z_t.shape)
+        sqrt_one_minus_alpha_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, z_t.shape)
+
+        z_0_pred = (z_t - sqrt_one_minus_alpha_cumprod_t * noise_pred) / sqrt_alpha_cumprod_t
+
+        return z_0_pred
 
     def p_mean_variance(self, model, z_t, t, c, clip_denoised=True):
         """
