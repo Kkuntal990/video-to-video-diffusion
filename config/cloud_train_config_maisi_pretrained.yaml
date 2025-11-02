@@ -1,0 +1,205 @@
+# Cloud Training Configuration for APE-Data
+# NVIDIA MAISI VAE (Pretrained) with Temporal Frame Stacking
+
+# Model Configuration
+model:
+  in_channels: 1  # Grayscale CT scans (medical imaging)
+  latent_dim: 4  # MAISI-like latent channels (medical imaging standard)
+  vae_base_channels: 64  # MAISI architecture: channels=(64, 128, 256)
+  vae_scaling_factor: 0.18215  # Standard latent scaling for diffusion models
+  unet_model_channels: 128
+  unet_num_res_blocks: 2
+  unet_attention_levels: [1, 2]
+  unet_channel_mult: [1, 2, 4, 4]  # Full 4-level U-Net for maximum capacity
+  unet_num_heads: 8
+  unet_time_embed_dim: 1024
+  noise_schedule: 'cosine'
+  diffusion_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+# Pretrained Weights Configuration
+# Using NVIDIA MAISI VAE with Temporal Frame Stacking
+# - Pretrained on 1000s of CT volumes (understands medical anatomy)
+# - Temporal stacking: Group consecutive frames into 3D volumes (stack_size=4)
+# - Allows MAISI's 3D convolutions to work with 2D+time videos
+# - Expected: Faster convergence, better reconstruction quality
+pretrained:
+  use_pretrained: true  # ENABLED - Load MAISI VAE pretrained weights
+
+  # VAE pretrained weights (ENABLED)
+  vae:
+    enabled: true  # Load pretrained MAISI VAE encoder/decoder
+    use_maisi: true  # Use NVIDIA MAISI VAE for medical CT imaging
+    checkpoint_path: './pretrained/maisi_vae/models/autoencoder.pt'  # Path to MAISI weights
+    stack_size: 4  # Frames per 3D volume (4 frames stacked for 3D processing)
+                   # T=16 frames → 4 volumes of 4 frames each → T_latent=4
+    freeze_epochs: 5  # Freeze VAE for first 5 epochs while U-Net learns
+
+  # Training strategy (two-phase for pretrained VAE)
+  two_phase_training: true  # Freeze VAE initially, then fine-tune
+  phase1_epochs: 5  # Phase 1: Freeze VAE and train U-Net for 5 epochs
+  # Phase 2: Fine-tune entire model for remaining 45 epochs
+
+  # Layer-wise learning rates (lower for pretrained VAE)
+  layer_lr_multipliers:
+    vae_encoder: 0.1  # Lower LR for pretrained encoder
+    vae_decoder: 0.1  # Lower LR for pretrained decoder
+    unet: 1.0  # Full LR for U-Net (training from scratch)
+
+# Data Configuration - HuggingFace with Caching
+data:
+  # Data source: 'huggingface' for cloud training, 'local' for local files
+  data_source: 'huggingface'
+
+  # HuggingFace dataset configuration
+  dataset_name: 't2ance/APE-data'
+  streaming: false  # Download to persistent storage (NOT streaming)
+  use_cache: true   # Preprocess once, load cached tensors (FAST!)
+  cache_dir: '/workspace/storage_a100/ape_cache'  # A100 persistent storage location
+  force_reprocess: false  # Set to true to regenerate preprocessed cache
+  max_samples: null 
+
+  # Categories to include
+  categories: ['APE', 'non APE']  # Use both categories (NOTE: "non APE" has a space!)
+
+  # Video settings
+  num_frames: 24  # Number of CT slices per sample - extended temporal context
+  resolution: [256, 256]  # H, W - higher resolution for better detail (4× more pixels than 128×128)
+
+  # CT windowing (for medical imaging)
+  window_center: 200  # HU window center for pulmonary/vascular imaging
+  window_width: 1800  # HU window width for lung+vessels (range: -700 to 1100 HU)
+
+  # Train/Val/Test Split (stratified by category)
+  val_split: 0.15  # 15% for validation
+  test_split: 0.10  # 10% for test
+  seed: 42  # Random seed for reproducible splits
+
+  # DataLoader settings
+  batch_size: 2
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  max_samples: null  # Use full dataset (475 patients) for production training
+
+# Training Configuration
+training:
+  num_epochs: 50  # Production training - ~6-7 days on V100 32GB
+  learning_rate: 0.0001  # 1e-4
+  weight_decay: 0.01
+
+  # Model identification (for managing multiple model variants)
+  model_suffix: 'maisi_pretrained_stack4'  # Suffix: MAISI pretrained VAE with frame stacking
+                                           # (checkpoint_best_epoch_10_maisi_pretrained_stack4.pt)
+                                           # Indicates pretrained MAISI VAE (stack_size=4)
+
+  # Optimization
+  optimizer: 'adamw'  # 'adam' or 'adamw'
+  gradient_accumulation_steps: 16  # Simulate batch_size=16 (actual batch=1)
+  max_grad_norm: 1.0  # Gradient clipping
+
+  # Mixed precision training (highly recommended for speed)
+  mixed_precision: true  # Use 'fp16' or 'bf16' on supported hardware
+  precision: 'fp16'  # 'fp16' or 'bf16'
+
+  # Learning rate scheduling
+  scheduler: 'cosine'  # 'cosine', 'linear', or 'constant'
+  warmup_steps: 1000  # Longer warmup for stability with high resolution
+  min_lr: 0.000001  # Minimum learning rate at end of cosine schedule (explicit float)
+
+  # Checkpointing
+  checkpoint_every: 1000  # Save every N steps (~5 checkpoints per epoch)
+  keep_last_n_checkpoints: 1  # Keep only the latest checkpoint to save disk space
+
+  # Validation
+  validate_every: 1000
+  num_validation_samples: 1
+
+  # Logging
+  log_interval: 100  # Log every N steps (reduce overhead)
+  output_dir: '/workspace/storage_a100/outputs'  # A100 output directory
+  log_dir: '/workspace/storage_a100/logs'  # A100 log directory
+  checkpoint_dir: '/workspace/storage_a100/checkpoints'  # A100 checkpoint directory
+  experiment_name: 'ape_v2v_diffusion'
+
+  # Weights & Biases (optional)
+  use_wandb: false  # Set to true to enable W&B logging
+  wandb_project: 'video-diffusion'
+  wandb_entity: null  # Your W&B username/team
+
+# Hardware Configuration
+hardware:
+  device: 'cuda'  # 'cuda' for GPU, 'cpu' for CPU
+  num_gpus: 1  # Number of GPUs to use
+  distributed: false  # Set to true for multi-GPU training
+
+  # Memory optimization (CRITICAL for 256×256 resolution!)
+  gradient_checkpointing: true  # REQUIRED: Saves ~50% activation memory, enables 256×256 on V100 32GB
+  cpu_offload: false  # Keep disabled (would slow training significantly)
+
+# Inference Configuration (for validation)
+inference:
+  sampler: 'ddim'  # 'ddim' or 'ddpm'
+  num_inference_steps: 50  # Number of denoising steps
+  guidance_scale: 1.0  # Classifier-free guidance scale
+  save_samples: true  # Save generated samples during validation
+  samples_per_validation: 5  # Number of samples to generate
+
+# Resume Training
+# The training script will automatically detect and resume from the best checkpoint
+# Use --resume flag to specify a specific checkpoint path if needed
+resume:
+  checkpoint_path: null  # Auto-detect best checkpoint (or use --resume CLI flag)
+  resume_optimizer: true  # Resume optimizer state
+  resume_scheduler: true  # Resume scheduler state
+
+# Early Stopping (optional)
+early_stopping:
+  enabled: false
+  patience: 10  # Stop if no improvement for N validations
+  metric: 'loss'  # Metric to monitor
+  mode: 'min'  # 'min' or 'max'
+
+# Notes - Production Configuration (256×256, 16 frames, V100 32GB):
+#
+# 1. CURRENT SETUP - Maximum Quality:
+#    - Model: 441M parameters (172M VAE + 270M U-Net)
+#    - Resolution: 256×256 (4× more detail than 128×128)
+#    - Frames: 16 (full temporal context)
+#    - Batch size: 1 (REQUIRED for memory constraints)
+#    - Gradient accumulation: 16 (effective batch = 16)
+#    - Gradient checkpointing: ENABLED (critical!)
+#
+# 2. MEMORY USAGE:
+#    - Estimated: ~22-24 GB on V100 32GB
+#    - Peak during backward pass: ~28-29 GB (monitor closely!)
+#    - Gradient checkpointing saves ~8 GB activation memory
+#    - WITHOUT gradient checkpointing: Would need ~40+ GB (OOM!)
+#
+# 3. TRAINING TIMELINE:
+#    - Total: ~7-8 days on Tesla V100 32GB (larger model = slower)
+#    - Phase 1 (5 epochs, VAE frozen): ~36 hours
+#    - Phase 2 (45 epochs, full fine-tuning): ~324 hours
+#    - ~7-8 hours per epoch, ~206 steps per epoch
+#
+# 4. IF OUT OF MEMORY (OOM):
+#    Fallback options (in order of preference):
+#    a) Reduce num_frames: 16 → 12 (saves ~25% memory)
+#    b) Reduce U-Net depth: unet_channel_mult=[1,2,4,4] → [1,2,4] (saves ~3GB)
+#    c) Reduce resolution: [256,256] → [224,224] (saves ~30% memory)
+#    d) Combination: num_frames=12, resolution=[224,224] (saves ~50% memory)
+#    e) Last resort: resolution=[128,128], num_frames=16
+#
+# 5. MONITORING CRITICAL FIRST 24 HOURS:
+#    - Watch GPU memory every 30 min for first 100 steps
+#    - kubectl exec <POD> -- nvidia-smi dmon -s mu -c 100
+#    - If memory > 30GB consistently, apply fallback option (b) first
+#    - Phase transition at epoch 5 may cause temporary spike
+#
+# 6. QUALITY EXPECTATIONS:
+#    - Full 4-level U-Net: Maximum model capacity (~65% larger than 3-level)
+#    - 4× better spatial detail than 128×128
+#    - Full temporal coherence across 16 CT slices
+#    - Clinically relevant resolution (closer to real CT scans)
+#    - Better preservation of fine anatomical structures

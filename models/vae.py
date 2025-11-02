@@ -210,19 +210,21 @@ class VideoVAE(nn.Module):
     """
 
     def __init__(self, in_channels=3, latent_dim=4, base_channels=64, scaling_factor=0.18215,
-                 use_maisi=False, maisi_checkpoint=None, use_maisi_arch=False):
+                 use_maisi=False, maisi_checkpoint=None, use_maisi_arch=False, maisi_stack_size=4):
         super().__init__()
 
         self.use_maisi = (use_maisi and maisi_checkpoint is not None)  # Only True if loading pretrained MAISI
         self.use_maisi_arch = use_maisi_arch  # Using MAISI-like architecture (but 2D, not 3D)
         self.latent_dim = latent_dim
         self.in_channels = in_channels
+        self.maisi_stack_size = maisi_stack_size  # Frames to stack as 3D volume for MAISI
 
         if self.use_maisi:
             # Load pretrained MAISI VAE (3D volumetric)
             print("Initializing MAISI VAE with pretrained weights...")
+            print(f"  Temporal stacking: {maisi_stack_size} frames per 3D volume")
             self._load_maisi_vae(maisi_checkpoint)
-            self.scaling_factor = 1.0  # MAISI has built-in scaling
+            self.scaling_factor = 0.18215  # Use standard scaling for compatibility
         elif use_maisi_arch:
             # Use MAISI-inspired 2D architecture (grayscale, medical imaging optimized)
             print("Initializing MAISI-inspired 2D architecture (grayscale, training from scratch)...")
@@ -406,12 +408,16 @@ class VideoVAE(nn.Module):
 
     def _encode_with_maisi(self, x):
         """
-        Encode video using MAISI VAE
+        Encode video using MAISI VAE with temporal frame stacking
+
+        Strategy: Group consecutive frames into 3D volumes to satisfy MAISI's
+        3D convolution requirements (kernel_size=3×3×3 needs depth >= 3)
 
         Args:
             x: (B, C, T, H, W) video tensor, C should be 1 for grayscale
         Returns:
-            z: (B, latent_dim, T, H//8, W//8) latent tensor
+            z: (B, latent_dim, T_latent, H//8, W//8) latent tensor
+               where T_latent = T // stack_size
         """
         B, C, T, H, W = x.shape
 
@@ -419,73 +425,99 @@ class VideoVAE(nn.Module):
         if C != 1:
             raise ValueError(f"MAISI VAE expects 1-channel grayscale input, got {C} channels")
 
-        # Process each frame through MAISI 3D VAE
-        # MAISI processes 3D volumes, so we treat each video frame as a thin 3D volume
-        latents = []
-        for t in range(T):
-            # Extract single frame: (B, 1, 1, H, W) - treat as thin 3D volume (D=1)
-            frame_3d = x[:, :, t:t+1, :, :]
+        stack_size = self.maisi_stack_size  # e.g., 4 frames
 
-            # Encode through MAISI VAE
-            # MAISI returns latent distribution, we use the mean (deterministic)
-            z_dist = self.maisi_vae.encode(frame_3d)
-            if hasattr(z_dist, 'sample'):
-                # If it's a distribution, sample from it
-                z_t = z_dist.sample()
-            elif isinstance(z_dist, tuple):
-                # Some implementations return (mean, logvar)
-                z_t = z_dist[0]
-            else:
-                # Direct latent output
-                z_t = z_dist
+        # Pad temporal dimension if not divisible by stack_size
+        T_original = T
+        if T % stack_size != 0:
+            pad_size = stack_size - (T % stack_size)
+            # Pad by repeating last frame
+            last_frames = x[:, :, -1:, :, :].repeat(1, 1, pad_size, 1, 1)
+            x = torch.cat([x, last_frames], dim=2)
+            T = x.shape[2]
 
-            # z_t shape: (B, latent_channels, 1, H//8, W//8)
-            # Squeeze the depth dimension
-            z_t = z_t.squeeze(2)  # (B, latent_channels, H//8, W//8)
+        # Reshape: (B, C, T, H, W) → (B*num_volumes, C, stack_size, H, W)
+        num_volumes = T // stack_size
+        x_volumes = x.reshape(B, C, num_volumes, stack_size, H, W)
+        x_volumes = x_volumes.permute(0, 2, 1, 3, 4, 5)  # (B, num_volumes, C, stack_size, H, W)
+        x_volumes = x_volumes.reshape(B * num_volumes, C, stack_size, H, W)
 
-            latents.append(z_t)
+        # Encode all volumes through MAISI VAE
+        z_dist = self.maisi_vae.encode(x_volumes)
+        if hasattr(z_dist, 'sample'):
+            z_volumes = z_dist.sample()
+        elif isinstance(z_dist, tuple):
+            z_volumes = z_dist[0]
+        else:
+            z_volumes = z_dist
 
-        # Stack along temporal dimension
-        z = torch.stack(latents, dim=2)  # (B, latent_dim, T, H//8, W//8)
+        # z_volumes shape: (B*num_volumes, latent_channels, D_latent, h, w)
+        # MAISI compresses depth too, typically D_latent = stack_size // 8 = 1 for stack_size=4
+        # Reshape back: (B*num_volumes, latent_channels, D_latent, h, w) → (B, latent_channels, num_volumes*D_latent, h, w)
+        latent_channels = z_volumes.shape[1]
+        D_latent = z_volumes.shape[2]
+        h, w = z_volumes.shape[3], z_volumes.shape[4]
 
-        # Apply scaling factor (typically 1.0 for MAISI)
+        z_volumes = z_volumes.reshape(B, num_volumes, latent_channels, D_latent, h, w)
+        z_volumes = z_volumes.permute(0, 2, 1, 3, 4, 5)  # (B, latent_channels, num_volumes, D_latent, h, w)
+        z = z_volumes.reshape(B, latent_channels, num_volumes * D_latent, h, w)
+
+        # If we padded, crop back to original temporal size (in latent space)
+        if T_original != T:
+            # Calculate original latent temporal size
+            T_latent_original = (T_original + stack_size - 1) // stack_size  # ceiling division
+            T_latent_original = min(T_latent_original, z.shape[2])
+            z = z[:, :, :T_latent_original, :, :]
+
+        # Apply scaling factor
         z = z * self.scaling_factor
 
         return z
 
     def _decode_with_maisi(self, z):
         """
-        Decode latent using MAISI VAE
+        Decode latent using MAISI VAE with temporal frame unstacking
+
+        This is the inverse of _encode_with_maisi()
 
         Args:
-            z: (B, latent_dim, T, H//8, W//8) latent tensor
+            z: (B, latent_dim, T_latent, h, w) latent tensor
         Returns:
             x: (B, 1, T, H, W) reconstructed video tensor
+               where T ≈ T_latent * stack_size
         """
         # Unscale latents
         z = z / self.scaling_factor
 
-        B, C, T, H, W = z.shape
+        B, latent_channels, T_latent, h, w = z.shape
+        stack_size = self.maisi_stack_size
 
-        # Decode each frame through MAISI VAE
-        frames = []
-        for t in range(T):
-            # Extract latent for this frame: (B, C, H, W)
-            z_t = z[:, :, t, :, :]
+        # MAISI compresses depth, so we need to infer original structure
+        # Assume D_latent = 1 for stack_size=4 (typical 8× depth compression)
+        # So num_volumes = T_latent / D_latent = T_latent
 
-            # Add depth dimension for 3D VAE: (B, C, 1, H, W)
-            z_t_3d = z_t.unsqueeze(2)
+        # For now, assume D_latent = 1 (MAISI heavily compresses depth dimension)
+        D_latent = 1
+        num_volumes = T_latent // D_latent
 
-            # Decode through MAISI VAE
-            frame_3d = self.maisi_vae.decode(z_t_3d)  # (B, 1, 1, H*8, W*8)
+        # Reshape to volumes: (B, latent_channels, num_volumes, D_latent, h, w)
+        z_volumes = z.reshape(B, latent_channels, num_volumes, D_latent, h, w)
+        z_volumes = z_volumes.permute(0, 2, 1, 3, 4, 5)  # (B, num_volumes, latent_channels, D_latent, h, w)
+        z_volumes = z_volumes.reshape(B * num_volumes, latent_channels, D_latent, h, w)
 
-            # Squeeze depth dimension
-            frame = frame_3d.squeeze(2)  # (B, 1, H*8, W*8)
+        # Decode all volumes through MAISI VAE
+        x_volumes = self.maisi_vae.decode(z_volumes)  # (B*num_volumes, 1, stack_size, H, W)
 
-            frames.append(frame)
+        # x_volumes shape: (B*num_volumes, C_out, D_out, H, W)
+        # where D_out = stack_size (MAISI upsamples depth back to original)
+        C_out = x_volumes.shape[1]
+        D_out = x_volumes.shape[2]
+        H, W = x_volumes.shape[3], x_volumes.shape[4]
 
-        # Stack along temporal dimension
-        x = torch.stack(frames, dim=2)  # (B, 1, T, H*8, W*8)
+        # Reshape back: (B*num_volumes, C_out, D_out, H, W) → (B, C_out, T, H, W)
+        x_volumes = x_volumes.reshape(B, num_volumes, C_out, D_out, H, W)
+        x_volumes = x_volumes.permute(0, 2, 1, 3, 4, 5)  # (B, C_out, num_volumes, D_out, H, W)
+        x = x_volumes.reshape(B, C_out, num_volumes * D_out, H, W)
 
         return x
 

@@ -49,11 +49,13 @@ class VideoToVideoDiffusion(nn.Module):
             # Check if using MAISI VAE (medical imaging specific)
             if vae_config.get('use_maisi', False):
                 print(f"Loading NVIDIA MAISI VAE for medical CT imaging...")
+                stack_size = vae_config.get('stack_size', 4)  # Frames per 3D volume
                 self.vae = VideoVAE(
                     in_channels=config.get('in_channels', 1),  # Grayscale for medical
                     latent_dim=4,  # MAISI uses 4 latent channels (verified from checkpoint)
                     use_maisi=True,
-                    maisi_checkpoint=vae_config.get('checkpoint_path', None)
+                    maisi_checkpoint=vae_config.get('checkpoint_path', None),
+                    maisi_stack_size=stack_size
                 )
             else:
                 # Load other pretrained VAE (SD VAE, etc.)
