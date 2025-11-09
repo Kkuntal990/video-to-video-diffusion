@@ -69,7 +69,7 @@ data:
   use_full_volumes: true
   max_thick_slices: 50   # Keep up to 50 thick slices (5.0mm)
   max_thin_slices: 300   # Keep up to 300 thin slices (1.0mm)
-  resolution: [512, 512]  # H, W - full resolution
+  resolution: [256, 256]  # H, W - reduced resolution for faster training
 
   # CT windowing
   window_center: 40   # HU for soft tissue
@@ -81,7 +81,7 @@ data:
   seed: 42
 
   # DataLoader settings
-  batch_size: 1  # Lower for full volumes (memory constraint)
+  batch_size: 2  # Increased from 1 (256×256 uses 4× less memory)
   num_workers: 0  # 0 for DICOM to avoid multiprocessing issues
   pin_memory: true
   drop_last: true
@@ -94,11 +94,11 @@ training:
   weight_decay: 0.01
 
   # Model identification
-  model_suffix: 'slice_interp_full_medium'
+  model_suffix: 'slice_interp_256_medium'
 
   # Optimization
   optimizer: 'adamw'
-  gradient_accumulation_steps: 8  # Effective batch_size = 2×8 = 16
+  gradient_accumulation_steps: 4  # Effective batch_size = 2×4 = 8 (was 1×8)
   max_grad_norm: 1.0  # Gradient clipping
 
   # Mixed precision
@@ -123,7 +123,7 @@ training:
   output_dir: '/workspace/storage_a100/outputs'
   log_dir: '/workspace/storage_a100/logs'
   checkpoint_dir: '/workspace/storage_a100/checkpoints'
-  experiment_name: 'slice_interp_full_medium'
+  experiment_name: 'slice_interp_256_medium'
 
   # Weights & Biases
   use_wandb: false
