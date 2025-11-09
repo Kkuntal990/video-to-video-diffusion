@@ -235,6 +235,19 @@ class Trainer:
                 step_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_step_{self.global_step}.pt')
                 self.save_checkpoint(step_checkpoint_filename)
 
+        # Handle any remaining accumulated gradients at end of epoch
+        # If num_batches % gradient_accumulation_steps != 0, there will be leftover gradients
+        # Example: 243 batches % 8 = 3 leftover batches that accumulated but never stepped
+        num_batches = len(self.train_dataloader)
+        if num_batches % self.gradient_accumulation_steps != 0:
+            # Step the optimizer with remaining accumulated gradients
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
         # Average epoch loss (convert to scalar only once at end of epoch)
         if epoch_loss_count > 0:
             avg_loss = (epoch_loss_sum / epoch_loss_count).item()
