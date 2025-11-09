@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-to-shared-pvc
+  namespace: ecepxie
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: rsync
+        image: ubuntu:22.04
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+            apt-get update && apt-get install -y rsync pv
+
+            echo "=============================================="
+            echo "Starting data migration to shared PVC"
+            echo "=============================================="
+            echo "Source: /old_storage"
+            echo "Destination: /new_storage"
+            echo ""
+
+            echo "Checking source size..."
+            du -sh /old_storage
+            echo ""
+
+            # Copy with progress
+            echo "Starting rsync..."
+            rsync -av --info=progress2 /old_storage/ /new_storage/
+
+            echo ""
+            echo "=============================================="
+            echo "✓ Migration complete!"
+            echo "=============================================="
+            echo "Verifying sizes..."
+            echo "Old storage:"
+            du -sh /old_storage
+            echo "New storage:"
+            du -sh /new_storage
+            echo ""
+            echo "Directory structure:"
+            ls -lh /new_storage
+        volumeMounts:
+        - name: old-storage
+          mountPath: /old_storage
+          readOnly: true
+        - name: new-storage
+          mountPath: /new_storage
+      volumes:
+      - name: old-storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal-a100
+      - name: new-storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal-a100-shared
+      # Schedule on node-1-4 where old PVC is currently attached
+      nodeSelector:
+        kubernetes.io/hostname: node-1-4.sdsc.optiputer.net

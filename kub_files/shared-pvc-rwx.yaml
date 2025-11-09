@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: v2v-diffuser-kuntal-a100-shared
+  namespace: ecepxie
+  labels:
+    app: v2v-diffusion
+    purpose: training-storage-shared
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple nodes can attach simultaneously
+  storageClassName: rook-cephfs  # CephFS supports ReadWriteMany
+  resources:
+    requests:
+      storage: 300Gi

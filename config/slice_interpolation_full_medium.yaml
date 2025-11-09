@@ -11,7 +11,7 @@ model:
   vae_scaling_factor: 0.18215  # MAISI scaling factor
 
   # U-Net Configuration - MEDIUM MODEL (192 channels)
-  unet_model_channels: 128  # ↑ from 128 (+50%) → 599M params total
+  unet_model_channels: 192  # ↑ from 128 (+50%) → 599M params total
   unet_num_res_blocks: 2
   unet_attention_levels: [1, 2]
   unet_channel_mult: [1, 2, 4, 4]  # Full 4-level U-Net
@@ -76,7 +76,7 @@ data:
   window_width: 400   # HU for soft tissue + vessels
 
   # Train/Val/Test split
-  val_split: 0.15  # 15% validation (≈53 patients)
+  val_split: 0.10  # 15% validation (≈53 patients)
   test_split: 0.10  # 10% test (≈36 patients)
   seed: 42
 
@@ -112,11 +112,11 @@ training:
 
   # Checkpointing
   checkpoint_every: 2000  # Save every 2000 steps (reduced for speed)
-  keep_last_n_checkpoints: 3  # Keep last 3 checkpoints
+  keep_last_n_checkpoints: 2  # Keep last 3 checkpoints
 
   # Validation
   val_interval: 1000  # Validate every 500 steps (fixed parameter name)
-  num_validation_samples: 10
+  num_validation_samples: 20
 
   # Logging
   log_interval: 50
