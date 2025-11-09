@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v2v-diffusion-training-job-a100-256
+spec:
+  template:
+    metadata:
+      labels:
+        app: v2v-diffusion
+        type: training-job
+        gpu: a100
+        resolution: 256x256
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: training
+        image: ghcr.io/kkuntal990/v2v-diffusion:256x256
+        imagePullPolicy: Always
+
+        # Training command
+        command: ["/bin/bash"]
+        args:
+        - "-c"
+        - |
+          echo "Starting training on A100 80GB..."
+          echo "GPU Info:"
+          nvidia-smi
+          echo ""
+          echo "Node: $(hostname)"
+          echo ""
+
+          # Use custom MAISI VAE config (100% pretrained weights)
+          python train.py --config config/slice_interpolation_full_medium.yaml
+
+          echo "Training completed!"
+
+        resources:
+          requests:
+            memory: "16Gi"  # Reduced for 256×256 resolution (uses ~8-12 GB)
+            cpu: "4"
+            nvidia.com/a100: "1"
+          limits:
+            memory: "16Gi"  # Lower memory needed for 256×256
+            cpu: "4"
+            nvidia.com/a100: "1"
+
+        volumeMounts:
+        - name: storage
+          mountPath: /workspace/storage_a100  # A100 storage
+        - name: dshm
+          mountPath: /dev/shm
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TORCH_HOME
+          value: "/workspace/storage_a100/.cache/torch"
+        - name: HF_HOME
+          value: "/workspace/storage_a100/.cache/huggingface"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal-a100  # A100 storage
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"  # Increased shared memory for larger GPU
+
+      # Tolerations for A100 GPU nodes
+      tolerations:
+      - effect: NoSchedule
+        key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+
+      # Node affinity to ensure 80GB A100 (not 40GB)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
