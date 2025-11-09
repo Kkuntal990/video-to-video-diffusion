@@ -157,6 +157,12 @@ class Trainer:
     def train_epoch(self):
         """Train for one epoch"""
         self.model.train()
+
+        # Clear any leftover accumulated gradients from previous epoch
+        # This is critical when gradient_accumulation_steps doesn't divide evenly into num_batches
+        # Example: 243 batches % 8 steps = 3 leftover batches that never called optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
         epoch_losses = []  # Store loss tensors to avoid repeated CPU-GPU sync
         epoch_loss_sum = 0.0
         epoch_loss_count = 0
