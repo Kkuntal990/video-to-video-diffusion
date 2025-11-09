@@ -210,18 +210,56 @@ class VideoVAE(nn.Module):
     """
 
     def __init__(self, in_channels=3, latent_dim=4, base_channels=64, scaling_factor=0.18215,
-                 use_maisi=False, maisi_checkpoint=None, use_maisi_arch=False, maisi_stack_size=4):
+                 use_maisi=False, maisi_checkpoint=None, use_maisi_arch=False, maisi_stack_size=4,
+                 use_custom_maisi=False, gradient_checkpointing=False):
         super().__init__()
 
-        self.use_maisi = (use_maisi and maisi_checkpoint is not None)  # Only True if loading pretrained MAISI
+        self.use_maisi = (use_maisi and maisi_checkpoint is not None)  # Only True if loading MONAI MAISI
+        self.use_custom_maisi = use_custom_maisi  # Use custom MAISIVAE with 100% weight loading
         self.use_maisi_arch = use_maisi_arch  # Using MAISI-like architecture (but 2D, not 3D)
         self.latent_dim = latent_dim
         self.in_channels = in_channels
         self.maisi_stack_size = maisi_stack_size  # Frames to stack as 3D volume for MAISI
+        self.gradient_checkpointing = gradient_checkpointing
 
-        if self.use_maisi:
-            # Load pretrained MAISI VAE (3D volumetric)
-            print("Initializing MAISI VAE with pretrained weights...")
+        if self.use_custom_maisi:
+            # Use custom MAISIVAE with 100% pretrained weight loading
+            print("Initializing custom MAISI VAE (100% pretrained weights)...")
+            if gradient_checkpointing:
+                print("  ✓ Gradient checkpointing enabled for MAISI VAE")
+            from .maisi_vae import MAISIVAE
+
+            self.maisi_vae = MAISIVAE(
+                in_channels=1,  # Grayscale CT
+                out_channels=1,
+                latent_channels=4,
+                scaling_factor=0.18215,
+                use_checkpoint=gradient_checkpointing
+            )
+
+            # Load pretrained weights if checkpoint provided
+            if maisi_checkpoint is not None:
+                print(f"Loading MAISI checkpoint: {maisi_checkpoint}")
+                stats = self.maisi_vae.load_pretrained_weights(maisi_checkpoint, strict=False)
+
+                if stats['loaded'] == stats['total']:
+                    print(f"🎉 SUCCESS! {stats['loaded']}/{stats['total']} MAISI weights loaded (100%)!")
+                else:
+                    print(f"⚠ Loaded {stats['loaded']}/{stats['total']} ({stats['loaded']/stats['total']*100:.1f}%) weights")
+            else:
+                print("⚠ No checkpoint provided - using random initialization")
+
+            # CRITICAL: Freeze MAISI VAE weights (pretrained, should not be trained)
+            for param in self.maisi_vae.parameters():
+                param.requires_grad = False
+            print("  ✓ MAISI VAE weights frozen (requires_grad=False)")
+
+            self.latent_dim = 4  # MAISI uses 4 latent channels
+            self.scaling_factor = 0.18215
+
+        elif self.use_maisi:
+            # Load pretrained MAISI VAE (3D volumetric) - MONAI version (partial loading)
+            print("Initializing MONAI MAISI VAE with pretrained weights...")
             print(f"  Temporal stacking: {maisi_stack_size} frames per 3D volume")
             self._load_maisi_vae(maisi_checkpoint)
             self.scaling_factor = 0.18215  # Use standard scaling for compatibility
@@ -373,16 +411,33 @@ class VideoVAE(nn.Module):
                 "MONAI is required for MAISI architecture. Install with: pip install 'monai[all]>=1.4.0'"
             )
 
-    def encode(self, x):
+    def encode(self, x, chunk_size=32):
         """
         Encode video to latent space with scaling
+
+        For large volumes (D > chunk_size), uses chunked encoding to reduce memory usage.
+
         Args:
             x: (B, C, T, H, W) video tensor in range [-1, 1]
                C=1 for MAISI (grayscale), C=3 for custom VAE (RGB)
+            chunk_size: Process volumes in chunks of this many slices (default: 32)
+                       Only used for custom MAISI VAE with large volumes
         Returns:
             z: (B, latent_dim, T, h, w) scaled latent tensor
         """
-        if self.use_maisi:
+        if self.use_custom_maisi:
+            # Use custom MAISIVAE with chunked encoding for large volumes
+            # Input: (B, C, D, H, W) where C=1 (grayscale), D is depth (variable)
+            # Output: (B, 4, D/4, H/8, W/8) - already scaled by MAISIVAE
+
+            # For large volumes, process in chunks to reduce memory usage
+            B, C, D, H, W = x.shape
+            if D > chunk_size:
+                return self._encode_chunked(x, chunk_size)
+            else:
+                return self.maisi_vae.encode(x)
+
+        elif self.use_maisi:
             return self._encode_with_maisi(x)
         else:
             z = self.encoder(x)
@@ -390,21 +445,123 @@ class VideoVAE(nn.Module):
             z = z * self.scaling_factor
             return z
 
-    def decode(self, z):
+    def decode(self, z, chunk_size=8):
         """
         Decode latent to video with unscaling
+
+        For large volumes (d > chunk_size), uses chunked decoding to reduce memory usage.
+
         Args:
             z: (B, latent_dim, T, h, w) scaled latent tensor
+            chunk_size: Process latents in chunks (default: 8 latent slices = 32 output slices)
+                       Only used for custom MAISI VAE with large volumes
         Returns:
             x: (B, C, T, H, W) reconstructed video in range [-1, 1]
                C=1 for MAISI (grayscale), C=3 for custom VAE (RGB)
         """
-        if self.use_maisi:
+        if self.use_custom_maisi:
+            # Use custom MAISIVAE with chunked decoding for large volumes
+            # Input: (B, 4, d, h, w) - scaled latent (d = D/4 where D is original depth)
+            # Output: (B, 1, D, H, W) - grayscale CT
+
+            # For large latents, process in chunks to reduce memory usage
+            B, C, d, h, w = z.shape
+            if d > chunk_size:
+                return self._decode_chunked(z, chunk_size)
+            else:
+                return self.maisi_vae.decode(z)
+
+        elif self.use_maisi:
             return self._decode_with_maisi(z)
         else:
             # Unscale latents before decoding
             z = z / self.scaling_factor
             return self.decoder(z)
+
+    def _encode_chunked(self, x, chunk_size=32):
+        """
+        Encode large volume in chunks to reduce memory usage
+
+        Processes the volume in non-overlapping chunks along the depth dimension,
+        then concatenates the latent representations.
+
+        Args:
+            x: (B, C, D, H, W) input volume (C=1 for grayscale CT)
+            chunk_size: Number of slices to process at once (default: 32)
+
+        Returns:
+            z: (B, 4, d, h, w) latent representation (d = D/4)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        B, C, D, H, W = x.shape
+        chunks = []
+
+        # Log chunking info (only once per batch)
+        if not hasattr(self, '_logged_chunking'):
+            num_chunks = (D + chunk_size - 1) // chunk_size
+            logger.info(f"Using chunked encoding: {D} slices → {num_chunks} chunks of max {chunk_size} slices")
+            logger.info(f"  Memory savings: ~{100 * (1 - chunk_size/D):.0f}% peak reduction vs full volume")
+            self._logged_chunking = True
+
+        # Process volume in non-overlapping chunks
+        for i in range(0, D, chunk_size):
+            end_idx = min(i + chunk_size, D)
+            chunk = x[:, :, i:end_idx, :, :]  # (B, C, chunk_size, H, W)
+
+            # Encode this chunk
+            with torch.cuda.amp.autocast(enabled=False):  # Ensure consistent precision
+                z_chunk = self.maisi_vae.encode(chunk)  # (B, 4, chunk_size/4, H/8, W/8)
+
+            chunks.append(z_chunk)
+
+        # Concatenate all chunks along depth dimension
+        z = torch.cat(chunks, dim=2)  # (B, 4, D/4, H/8, W/8)
+
+        return z
+
+    def _decode_chunked(self, z, chunk_size=8):
+        """
+        Decode large latent in chunks to reduce memory usage
+
+        Processes the latent in chunks along the depth dimension,
+        then concatenates the reconstructed volumes.
+
+        Args:
+            z: (B, 4, d, h, w) latent representation (d = D/4 where D is original depth)
+            chunk_size: Number of latent slices to process at once (default: 8)
+                       Note: 8 latent slices → 32 output slices (4x upsampling)
+
+        Returns:
+            x: (B, 1, D, H, W) reconstructed volume
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        B, C, d, h, w = z.shape
+        chunks = []
+
+        # Log chunking info (only once per batch)
+        if not hasattr(self, '_logged_decode_chunking'):
+            logger.info(f"Using chunked decoding: {d} latent slices → {(d + chunk_size - 1) // chunk_size} chunks of {chunk_size} slices")
+            self._logged_decode_chunking = True
+
+        # Process latent in non-overlapping chunks
+        for i in range(0, d, chunk_size):
+            end_idx = min(i + chunk_size, d)
+            chunk = z[:, :, i:end_idx, :, :]  # (B, 4, chunk_size, h, w)
+
+            # Decode this chunk
+            with torch.cuda.amp.autocast(enabled=False):  # Ensure consistent precision
+                x_chunk = self.maisi_vae.decode(chunk)  # (B, 1, chunk_size*4, H, W)
+
+            chunks.append(x_chunk)
+
+        # Concatenate all chunks along depth dimension
+        x = torch.cat(chunks, dim=2)  # (B, 1, D, H, W)
+
+        return x
 
     def _encode_with_maisi(self, x):
         """

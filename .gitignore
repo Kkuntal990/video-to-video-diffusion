@@ -43,6 +43,10 @@ checkpoints/
 *.ckpt
 pretrained_weights/
 
+# visualisations 
+visualizations/
+
+
 # Training logs and outputs
 logs/
 runs/

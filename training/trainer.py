@@ -256,9 +256,14 @@ class Trainer:
         ssim_sum = 0.0
         val_count = 0
 
-        pbar = tqdm(self.val_dataloader, desc="Validation")
+        # Limit validation samples for speed (config parameter)
+        max_samples = self.config.get('num_validation_samples', 2)
+        pbar = tqdm(self.val_dataloader, desc="Validation", total=min(max_samples, len(self.val_dataloader)))
 
         for batch in pbar:
+            # Stop after max_samples to speed up validation
+            if val_count >= max_samples:
+                break
             v_in = batch['input'].to(self.device)
             v_gt = batch['target'].to(self.device)
 
@@ -274,9 +279,9 @@ class Trainer:
             try:
                 if self.use_amp:
                     with autocast():
-                        v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=50)
+                        v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20)
                 else:
-                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=50)
+                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20)
 
                 # Calculate SSIM and PSNR metrics
                 # Clamp values to [0, 1] range for metric calculation
@@ -400,6 +405,13 @@ class Trainer:
         # Training complete
         elapsed_time = time.time() - start_time
         print(f"\nTraining complete! Total time: {elapsed_time / 3600:.2f} hours")
+
+        # Run final validation to get end-of-training metrics
+        if self.val_dataloader:
+            print("\nRunning final validation...")
+            final_val_loss = self.validate()
+            self.writer.add_scalar('val/final_loss', final_val_loss, self.global_step)
+            print(f"Final validation loss: {final_val_loss:.4f}")
 
         # Save final checkpoint
         final_checkpoint_filename = self._get_checkpoint_filename('checkpoint_final.pt')
