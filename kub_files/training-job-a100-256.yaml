@@ -9,7 +9,6 @@ spec:
         app: v2v-diffusion
         type: training-job
         gpu: a100
-        resolution: 256x256
     spec:
       restartPolicy: Never
 
@@ -83,12 +82,16 @@ spec:
         key: nvidia.com/gpu
         operator: Exists
 
-      # Node affinity to ensure 80GB A100 (not 40GB)
+      # Node affinity to ensure same node as 512×512 training (for PVC sharing)
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
             - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - node-1-4.sdsc.optiputer.net
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
