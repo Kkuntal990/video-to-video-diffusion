@@ -115,8 +115,8 @@ training:
   keep_last_n_checkpoints: 3  # Keep last 3 checkpoints
 
   # Validation
-  val_interval: 1000  # Validate every 500 steps (fixed parameter name)
-  num_validation_samples: 10
+  val_interval: 1000  # Validate every 1000 steps
+  num_validation_samples: 20  # Increased for better validation statistics
 
   # Logging
   log_interval: 50
