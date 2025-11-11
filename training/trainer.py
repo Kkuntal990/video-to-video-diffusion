@@ -479,10 +479,19 @@ class Trainer:
         self.model = loaded_model
         print(f"✓ Model weights loaded successfully")
 
+        # CRITICAL: Recreate optimizer with NEW model parameters
+        # The old optimizer still references the old model's parameters!
+        self.optimizer = self._create_optimizer()
+
         # Restore optimizer state
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"✓ Optimizer state restored")
+
+        # CRITICAL: Recreate scheduler with NEW optimizer
+        # The old scheduler references the old optimizer!
+        if self.scheduler is not None:
+            self.scheduler = self._create_scheduler()
 
         # Restore scheduler state
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
