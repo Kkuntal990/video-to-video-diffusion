@@ -174,13 +174,19 @@ class Trainer:
             v_in = batch['input'].to(self.device)
             v_gt = batch['target'].to(self.device)
 
+            # Extract padding mask for target (thin slices) - CRITICAL for variable depths!
+            # Prevents model from learning on zero-padded regions
+            mask = batch.get('thin_mask', None)
+            if mask is not None:
+                mask = mask.to(self.device)
+
             # Forward pass with mixed precision
             if self.use_amp:
                 with autocast():
-                    loss, metrics = self.model(v_in, v_gt)
+                    loss, metrics = self.model(v_in, v_gt, mask=mask)
                     loss = loss / self.gradient_accumulation_steps
             else:
-                loss, metrics = self.model(v_in, v_gt)
+                loss, metrics = self.model(v_in, v_gt, mask=mask)
                 loss = loss / self.gradient_accumulation_steps
 
             # Backward pass

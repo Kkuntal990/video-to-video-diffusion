@@ -700,12 +700,16 @@ def collate_variable_depth(batch: List[Dict]) -> Dict:
     max_thin_depth = max(t.shape[1] for t in thin_tensors)    # Max D_thin
 
     # Pad all tensors to max depth (pad at the end of depth dimension)
+    # Also create padding masks: 1 = real data, 0 = padded (CRITICAL for correct loss!)
     thick_padded = []
     thin_padded = []
+    thick_masks = []
+    thin_masks = []
 
     for thick, thin in zip(thick_tensors, thin_tensors):
         # Pad thick: shape (1, D, H, W) -> (1, max_D, H, W)
-        thick_padding = max_thick_depth - thick.shape[1]
+        thick_depth = thick.shape[1]
+        thick_padding = max_thick_depth - thick_depth
         if thick_padding > 0:
             # Pad along dimension 1 (depth): (pad_left, pad_right) for last 3 dims
             # For 4D: (W_left, W_right, H_left, H_right, D_left, D_right, C_left, C_right)
@@ -714,22 +718,41 @@ def collate_variable_depth(batch: List[Dict]) -> Dict:
         else:
             thick_padded.append(thick)
 
+        # Create mask: 1 for real data, 0 for padding (1, D)
+        thick_mask = torch.cat([
+            torch.ones(1, thick_depth),
+            torch.zeros(1, thick_padding)
+        ], dim=1)
+        thick_masks.append(thick_mask)
+
         # Pad thin: shape (1, D, H, W) -> (1, max_D, H, W)
-        thin_padding = max_thin_depth - thin.shape[1]
+        thin_depth = thin.shape[1]
+        thin_padding = max_thin_depth - thin_depth
         if thin_padding > 0:
             thin_padded.append(F.pad(thin, (0, 0, 0, 0, 0, thin_padding), value=0))
         else:
             thin_padded.append(thin)
 
+        # Create mask: 1 for real data, 0 for padding (1, D)
+        thin_mask = torch.cat([
+            torch.ones(1, thin_depth),
+            torch.zeros(1, thin_padding)
+        ], dim=1)
+        thin_masks.append(thin_mask)
+
     # Stack into batch tensors: (B, 1, D, H, W)
     thick_batch = torch.stack(thick_padded, dim=0)  # (B, 1, max_D_thick, H, W)
     thin_batch = torch.stack(thin_padded, dim=0)    # (B, 1, max_D_thin, H, W)
+    thick_mask_batch = torch.stack(thick_masks, dim=0)  # (B, 1, max_D_thick)
+    thin_mask_batch = torch.stack(thin_masks, dim=0)    # (B, 1, max_D_thin)
 
     return {
         'thick': thick_batch,
         'thin': thin_batch,
         'input': thick_batch,    # Alias for trainer compatibility
         'target': thin_batch,    # Alias for trainer compatibility
+        'thick_mask': thick_mask_batch,  # Padding mask for thick slices
+        'thin_mask': thin_mask_batch,    # Padding mask for thin slices
         'category': [item['category'] for item in batch],
         'patient_id': [item['patient_id'] for item in batch],
         'num_thick_slices': [item['num_thick_slices'] for item in batch],

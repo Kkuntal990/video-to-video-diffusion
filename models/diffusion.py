@@ -105,7 +105,7 @@ class GaussianDiffusion(nn.Module):
 
         return z_t, noise
 
-    def training_loss(self, model, z_0, c, vae=None, v_gt=None, use_ssim=False, ssim_weight=0.0):
+    def training_loss(self, model, z_0, c, mask=None, vae=None, v_gt=None, use_ssim=False, ssim_weight=0.0):
         """
         Compute training loss for the denoising model
 
@@ -115,6 +115,8 @@ class GaussianDiffusion(nn.Module):
             model: denoising model (epsilon_theta)
             z_0: clean latent (B, C, T, H, W)
             c: conditioning latent (B, C, T, H, W)
+            mask: optional padding mask (B, C, T) where 1=real, 0=padding
+                  CRITICAL: Prevents learning on zero-padded regions!
             vae: VAE model for decoding (optional, for SSIM loss)
             v_gt: ground truth video (optional, for SSIM loss)
             use_ssim: whether to use MS-SSIM loss component
@@ -140,7 +142,26 @@ class GaussianDiffusion(nn.Module):
         noise_pred = model(z_t, t, c)
 
         # Compute MSE loss (base diffusion loss)
-        loss_mse = F.mse_loss(noise_pred, noise)
+        if mask is not None:
+            # Masked MSE loss: only compute loss on real (non-padded) regions
+            # Expand mask to match noise shape: (B, C, T) -> (B, C, T, H, W)
+            mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)  # (B, C, T, 1, 1)
+            mask_expanded = mask_expanded.expand_as(noise_pred)  # (B, C, T, H, W)
+
+            # Compute element-wise MSE and apply mask
+            mse_per_element = (noise_pred - noise) ** 2
+            masked_mse = mse_per_element * mask_expanded
+
+            # Average over masked elements only (not all elements)
+            num_valid_elements = mask_expanded.sum()
+            if num_valid_elements > 0:
+                loss_mse = masked_mse.sum() / num_valid_elements
+            else:
+                # Fallback if somehow all masked out (shouldn't happen)
+                loss_mse = masked_mse.mean()
+        else:
+            # No mask: standard MSE loss
+            loss_mse = F.mse_loss(noise_pred, noise)
 
         # Initialize loss dict
         loss_dict = {'mse': loss_mse.item()}

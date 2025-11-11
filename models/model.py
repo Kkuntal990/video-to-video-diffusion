@@ -160,7 +160,7 @@ class VideoToVideoDiffusion(nn.Module):
         """
         return self.vae.decode(z)
 
-    def forward(self, v_in, v_gt):
+    def forward(self, v_in, v_gt, mask=None):
         """
         Forward pass for training
 
@@ -169,6 +169,8 @@ class VideoToVideoDiffusion(nn.Module):
                   For slice interpolation: thick slices (T_in < T_gt)
             v_gt: ground truth video/volume (B, C, T_gt, H, W)
                   For slice interpolation: thin slices (T_gt > T_in)
+            mask: optional padding mask (B, C, T_gt) where 1=real data, 0=padding
+                  CRITICAL for variable-depth batches to avoid learning on padding
 
         Returns:
             loss: training loss (scalar)
@@ -193,11 +195,26 @@ class VideoToVideoDiffusion(nn.Module):
         else:
             z_in_upsampled = z_in
 
+        # If mask provided, downsample it to match latent depth (VAE reduces depth by factor)
+        z_mask = None
+        if mask is not None:
+            # VAE downsamples depth by a factor (typically 4-6x for MAISI)
+            # Downsample mask to match z_gt depth: (B, C, T_gt) -> (B, C, T_latent)
+            z_mask = F.interpolate(
+                mask.float().unsqueeze(-1).unsqueeze(-1),  # (B, C, T, 1, 1)
+                size=(z_gt.shape[2], 1, 1),  # Match latent depth
+                mode='trilinear',
+                align_corners=False
+            ).squeeze(-1).squeeze(-1)  # (B, C, T_latent)
+            # Binarize: threshold at 0.5
+            z_mask = (z_mask > 0.5).float()
+
         # Compute diffusion loss (with optional MS-SSIM)
         # Note: use_ssim and ssim_weight should be set in config
         # For now, defaulting to MSE only to maintain backward compatibility
         loss, loss_dict = self.diffusion.training_loss(
             self.unet, z_gt, z_in_upsampled,  # Use upsampled conditioning
+            mask=z_mask,  # Pass latent-space mask
             vae=self.vae,
             v_gt=v_gt,
             use_ssim=False,  # Can be enabled via config
