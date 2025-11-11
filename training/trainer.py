@@ -479,19 +479,51 @@ class Trainer:
         self.model = loaded_model
         print(f"✓ Model weights loaded successfully")
 
-        # CRITICAL: Recreate optimizer with NEW model parameters
-        # The old optimizer still references the old model's parameters!
-        self.optimizer = self._create_optimizer()
+        # CRITICAL: Update optimizer param_groups to reference NEW model parameters
+        # The old optimizer was created with the old model before load!
+        # We need to rebuild param_groups with the new model's parameters
+        self.optimizer.param_groups.clear()
+
+        # Rebuild param_groups based on training config
+        base_lr = self.config.get('learning_rate', 1e-4)
+        weight_decay = self.config.get('weight_decay', 0.01)
+
+        # Get learning rate multipliers from config
+        unet_mult = self.config.get('unet_lr_mult', 1.0)
+        vae_encoder_mult = self.config.get('vae_encoder_lr_mult', 0.1)
+        vae_decoder_mult = self.config.get('vae_decoder_lr_mult', 0.1)
+
+        # VAE encoder parameters (if trainable)
+        vae_encoder_params = [p for p in self.model.vae.encoder.parameters() if p.requires_grad]
+        if vae_encoder_params:
+            self.optimizer.add_param_group({
+                'params': vae_encoder_params,
+                'lr': base_lr * vae_encoder_mult,
+                'name': 'vae_encoder'
+            })
+
+        # VAE decoder parameters (if trainable)
+        vae_decoder_params = [p for p in self.model.vae.decoder.parameters() if p.requires_grad]
+        if vae_decoder_params:
+            self.optimizer.add_param_group({
+                'params': vae_decoder_params,
+                'lr': base_lr * vae_decoder_mult,
+                'name': 'vae_decoder'
+            })
+
+        # U-Net parameters (should always be trainable)
+        unet_params = [p for p in self.model.unet.parameters() if p.requires_grad]
+        if unet_params:
+            self.optimizer.add_param_group({
+                'params': unet_params,
+                'lr': base_lr * unet_mult,
+                'name': 'unet'
+            })
 
         # Restore optimizer state
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"✓ Optimizer state restored")
-
-        # CRITICAL: Recreate scheduler with NEW optimizer
-        # The old scheduler references the old optimizer!
-        if self.scheduler is not None:
-            self.scheduler = self._create_scheduler()
 
         # Restore scheduler state
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
