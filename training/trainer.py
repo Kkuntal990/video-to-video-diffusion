@@ -458,6 +458,7 @@ class Trainer:
             path,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
+            scaler=self.scaler,  # CRITICAL: Save GradScaler state for stable AMP resume
             epoch=self.current_epoch,
             global_step=self.global_step,
             current_phase=self.current_phase,
@@ -487,6 +488,11 @@ class Trainer:
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             print(f"✓ Scheduler state restored")
+
+        # Restore GradScaler state (CRITICAL for mixed precision training!)
+        if 'scaler_state_dict' in checkpoint and self.scaler is not None:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            print(f"✓ GradScaler state restored (scale={self.scaler.get_scale():.0f})")
 
         # Restore training state
         if 'epoch' in checkpoint:
@@ -519,6 +525,11 @@ class Trainer:
                 print("🔓 VAE unfrozen")
 
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+
+        # DEFENSIVE: Explicitly clear any stale gradients from loaded optimizer state
+        # This ensures clean slate even if optimizer state contained accumulated gradients
+        self.optimizer.zero_grad(set_to_none=True)
+        print(f"✓ Gradients cleared after checkpoint load")
 
 
 if __name__ == "__main__":

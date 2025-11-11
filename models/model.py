@@ -305,7 +305,7 @@ class VideoToVideoDiffusion(nn.Module):
 
         return v_out
 
-    def save_checkpoint(self, path, optimizer=None, scheduler=None, epoch=None, global_step=None,
+    def save_checkpoint(self, path, optimizer=None, scheduler=None, scaler=None, epoch=None, global_step=None,
                        current_phase=None, best_loss=None, **kwargs):
         """
         Save model checkpoint
@@ -314,6 +314,8 @@ class VideoToVideoDiffusion(nn.Module):
             path: save path
             optimizer: optimizer state (optional)
             scheduler: scheduler state (optional)
+            scaler: GradScaler state for mixed precision training (optional)
+                    CRITICAL for stable checkpoint resume with AMP!
             epoch: current epoch (optional)
             global_step: current global step (optional)
             current_phase: current training phase for two-phase training (optional)
@@ -329,6 +331,10 @@ class VideoToVideoDiffusion(nn.Module):
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()
         if scheduler is not None:
             checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        if scaler is not None:
+            # Save GradScaler state for mixed precision training
+            # Critical: preserves scale factor, growth/backoff counters
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
         if epoch is not None:
             checkpoint['epoch'] = epoch
         if global_step is not None:
