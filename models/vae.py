@@ -431,7 +431,7 @@ class VideoVAE(nn.Module):
             # Output: (B, 4, D/4, H/8, W/8) - already scaled by MAISIVAE
 
             # CRITICAL: Convert from [-1, 1] to [0, 1] for MAISI VAE
-            # MAISI was trained on [0, 1] range, but our diffusion uses [-1, 1]
+            # MAISI was trained on HU [-1000,1000] normalized to [0,1] (confirmed from paper)
             x = (x + 1.0) / 2.0
 
             # For large volumes, process in chunks to reduce memory usage
@@ -476,8 +476,17 @@ class VideoVAE(nn.Module):
                 x_recon = self.maisi_vae.decode(z)
 
             # CRITICAL: Convert from [0, 1] to [-1, 1] for diffusion
-            # MAISI outputs [0, 1] range, but our diffusion uses [-1, 1]
+            # MAISI outputs [0,1] range (confirmed from paper), but our diffusion uses [-1, 1]
+
+            # DEBUG: Log MAISI output range before conversion
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"MAISI VAE decode output range BEFORE conversion: [{x_recon.min():.3f}, {x_recon.max():.3f}]")
+
             x_recon = x_recon * 2.0 - 1.0
+
+            logger.info(f"MAISI VAE decode output range AFTER conversion: [{x_recon.min():.3f}, {x_recon.max():.3f}]")
+
             return x_recon
 
         elif self.use_maisi:
@@ -693,6 +702,39 @@ class VideoVAE(nn.Module):
         x = x_volumes.reshape(B, C_out, num_volumes * D_out, H, W)
 
         return x
+
+    def encode_with_posterior(self, x):
+        """
+        Encode video and return posterior distribution parameters (mu, logvar).
+
+        For VAE training from scratch.
+        Splits the encoder output into mean and log variance.
+
+        Args:
+            x: (B, C, T, H, W) video tensor in range [-1, 1]
+
+        Returns:
+            mu: (B, latent_dim//2, T, h, w) mean of latent distribution
+            logvar: (B, latent_dim//2, T, h, w) log variance of latent distribution
+        """
+        if self.use_custom_maisi or self.use_maisi:
+            raise NotImplementedError(
+                "encode_with_posterior is only for training custom VAE from scratch. "
+                "MAISI VAE is pretrained and frozen."
+            )
+
+        # Get encoder output (before scaling)
+        z = self.encoder(x)  # (B, latent_dim, T, H//8, W//8)
+
+        # Split into mu and logvar (half channels each)
+        # Standard VAE approach: encoder outputs 2*latent_dim channels
+        # We need to output twice as many channels from conv_out
+
+        # For now, split the latent_dim channels in half
+        # mu = first half, logvar = second half
+        mu, logvar = torch.chunk(z, 2, dim=1)
+
+        return mu, logvar
 
     def forward(self, x):
         """
