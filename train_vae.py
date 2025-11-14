@@ -245,10 +245,8 @@ class VAETrainer:
         for batch_idx, batch in enumerate(pbar):
             # Get thick slices as reconstruction target
             # For VAE training, we reconstruct the input
-            thick_slices = batch['thick'].to(self.device)  # (B, D, H, W)
-
-            # Add channel dimension: (B, D, H, W) -> (B, C, D, H, W)
-            thick_slices = thick_slices.unsqueeze(1)
+            # Dataset returns: (B, C, D, H, W) where C=1 (already has channel dim)
+            thick_slices = batch['thick'].to(self.device)  # (B, 1, D, H, W)
 
             # Forward pass with mixed precision
             if self.use_amp:
@@ -359,8 +357,8 @@ class VAETrainer:
                 break
 
             # Get thick slices
-            thick_slices = batch['thick'].to(self.device)
-            thick_slices = thick_slices.unsqueeze(1)  # Add channel dim
+            # Dataset returns: (B, C, D, H, W) where C=1 (already has channel dim)
+            thick_slices = batch['thick'].to(self.device)  # (B, 1, D, H, W)
 
             # Forward pass (deterministic)
             recon, z = self.vae(thick_slices)
