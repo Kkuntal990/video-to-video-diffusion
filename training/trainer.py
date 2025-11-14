@@ -494,7 +494,27 @@ class Trainer:
         vae_decoder_mult = self.config.get('vae_decoder_lr_mult', 0.1)
 
         # VAE encoder parameters (if trainable)
-        vae_encoder_params = [p for p in self.model.vae.encoder.parameters() if p.requires_grad]
+        # Handle different VAE architectures
+        vae_encoder_params = []
+        vae_decoder_params = []
+
+        if hasattr(self.model.vae, 'use_custom_maisi') and self.model.vae.use_custom_maisi:
+            # Custom MAISI VAE: encoder/decoder under maisi_vae
+            if hasattr(self.model.vae.maisi_vae, 'encoder'):
+                vae_encoder_params = [p for p in self.model.vae.maisi_vae.encoder.parameters() if p.requires_grad]
+            if hasattr(self.model.vae.maisi_vae, 'decoder'):
+                vae_decoder_params = [p for p in self.model.vae.maisi_vae.decoder.parameters() if p.requires_grad]
+        elif hasattr(self.model.vae, 'use_maisi') and self.model.vae.use_maisi:
+            # MONAI MAISI VAE: no separate encoder/decoder access
+            # Skip adding separate param groups for encoder/decoder
+            pass
+        else:
+            # Standard VAE or MAISI-arch: encoder/decoder directly accessible
+            if hasattr(self.model.vae, 'encoder'):
+                vae_encoder_params = [p for p in self.model.vae.encoder.parameters() if p.requires_grad]
+            if hasattr(self.model.vae, 'decoder'):
+                vae_decoder_params = [p for p in self.model.vae.decoder.parameters() if p.requires_grad]
+
         if vae_encoder_params:
             self.optimizer.add_param_group({
                 'params': vae_encoder_params,
@@ -503,7 +523,6 @@ class Trainer:
             })
 
         # VAE decoder parameters (if trainable)
-        vae_decoder_params = [p for p in self.model.vae.decoder.parameters() if p.requires_grad]
         if vae_decoder_params:
             self.optimizer.add_param_group({
                 'params': vae_decoder_params,

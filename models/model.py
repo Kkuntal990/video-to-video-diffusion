@@ -200,14 +200,14 @@ class VideoToVideoDiffusion(nn.Module):
         if mask is not None:
             # VAE downsamples depth by a factor (typically 4-6x for MAISI)
             # Downsample mask to match z_gt depth: (B, C, T_gt) -> (B, C, T_latent)
+            # FIXED: Use nearest-neighbor interpolation to preserve binary mask
+            # This prevents quantization errors at boundaries (trilinear creates fractional values)
             z_mask = F.interpolate(
                 mask.float().unsqueeze(-1).unsqueeze(-1),  # (B, C, T, 1, 1)
                 size=(z_gt.shape[2], 1, 1),  # Match latent depth
-                mode='trilinear',
-                align_corners=False
+                mode='nearest'  # Changed from 'trilinear' to preserve binary values
             ).squeeze(-1).squeeze(-1)  # (B, C, T_latent)
-            # Binarize: threshold at 0.5
-            z_mask = (z_mask > 0.5).float()
+            # No binarization needed with nearest-neighbor (already binary: 0 or 1)
 
         # Compute diffusion loss (with optional MS-SSIM)
         # Note: use_ssim and ssim_weight should be set in config
@@ -232,7 +232,7 @@ class VideoToVideoDiffusion(nn.Module):
     def generate(self, v_in, sampler, num_inference_steps=20, guidance_scale=1.0,
                  target_depth=None):
         """
-        Generate output video from input video
+        Generate output thin slices from input thick slices
 
         Args:
             v_in: input video/volume (B, C, T_in, H, W)

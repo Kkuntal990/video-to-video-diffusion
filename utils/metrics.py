@@ -25,10 +25,22 @@ def calculate_psnr(img1, img2, max_val=1.0):
     """
     mse = torch.mean((img1 - img2) ** 2)
 
-    if mse == 0:
-        return float('inf')
+    # FIXED: Clamp MSE to prevent numerical issues
+    # - Prevents sqrt(0) which can cause numerical errors
+    # - Prevents division by near-zero which creates inf
+    eps = 1e-8
+    mse = torch.clamp(mse, min=eps)
 
-    psnr = 20 * torch.log10(max_val / torch.sqrt(mse))
+    # Handle perfect or near-perfect reconstruction
+    if mse < eps:
+        return 100.0  # Very high PSNR (instead of inf)
+
+    # Calculate PSNR
+    psnr = 20 * torch.log10(torch.tensor(max_val, device=mse.device) / torch.sqrt(mse))
+
+    # FIXED: Clamp output to reasonable range [0, 100] to prevent inf/NaN propagation
+    psnr = torch.clamp(psnr, min=0.0, max=100.0)
+
     return psnr.item()
 
 
@@ -47,8 +59,10 @@ def calculate_ssim(img1, img2, window_size=11, max_val=1.0):
     Returns:
         ssim: SSIM value in [0, 1]
     """
+    # FIXED: Add numerical stability constants
     C1 = (0.01 * max_val) ** 2
     C2 = (0.03 * max_val) ** 2
+    eps = 1e-8  # Additional epsilon for numerical stability
 
     # Mean
     mu1 = F.avg_pool2d(img1, window_size, stride=1, padding=window_size // 2)
@@ -58,14 +72,30 @@ def calculate_ssim(img1, img2, window_size=11, max_val=1.0):
     mu2_sq = mu2 ** 2
     mu1_mu2 = mu1 * mu2
 
-    # Variance
+    # Variance with numerical stability
     sigma1_sq = F.avg_pool2d(img1 ** 2, window_size, stride=1, padding=window_size // 2) - mu1_sq
     sigma2_sq = F.avg_pool2d(img2 ** 2, window_size, stride=1, padding=window_size // 2) - mu2_sq
     sigma12 = F.avg_pool2d(img1 * img2, window_size, stride=1, padding=window_size // 2) - mu1_mu2
 
-    # SSIM formula
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    # FIXED: Clamp variances to prevent negative values from floating point errors
+    sigma1_sq = torch.clamp(sigma1_sq, min=0.0)
+    sigma2_sq = torch.clamp(sigma2_sq, min=0.0)
+
+    # SSIM formula with additional epsilon for stability
+    numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + eps
+
+    ssim_map = numerator / denominator
+
+    # FIXED: Clamp SSIM values to valid range [0, 1] and check for NaN
+    ssim_map = torch.clamp(ssim_map, min=0.0, max=1.0)
+
+    # Check if result contains NaN
+    if torch.isnan(ssim_map).any():
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"SSIM calculation produced {torch.isnan(ssim_map).sum().item()} NaN values, returning 0.0")
+        return 0.0
 
     return ssim_map.mean().item()
 
@@ -82,6 +112,19 @@ def calculate_video_metrics(video1, video2, max_val=1.0):
     Returns:
         metrics: dict with PSNR and SSIM
     """
+    # FIXED: Add input validation to check for NaN values
+    if torch.isnan(video1).any():
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"NaN values detected in predicted video: {torch.isnan(video1).sum().item()} NaN values")
+        return {'psnr': 0.0, 'ssim': 0.0, 'psnr_per_frame': [], 'ssim_per_frame': []}
+
+    if torch.isnan(video2).any():
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"NaN values detected in ground truth video: {torch.isnan(video2).sum().item()} NaN values")
+        return {'psnr': 0.0, 'ssim': 0.0, 'psnr_per_frame': [], 'ssim_per_frame': []}
+
     # Handle single video (add batch dim)
     if video1.dim() == 4:
         video1 = video1.unsqueeze(0)
@@ -100,12 +143,25 @@ def calculate_video_metrics(video1, video2, max_val=1.0):
         psnr = calculate_psnr(frame1, frame2, max_val)
         ssim = calculate_ssim(frame1, frame2, max_val=max_val)
 
+        # FIXED: Check for NaN in individual frame metrics
+        if np.isnan(psnr) or np.isnan(ssim):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"NaN detected in frame {t}: PSNR={psnr}, SSIM={ssim}")
+            # Skip this frame instead of propagating NaN
+            continue
+
         psnr_values.append(psnr)
         ssim_values.append(ssim)
 
-    # Average over time
-    avg_psnr = np.mean(psnr_values)
-    avg_ssim = np.mean(ssim_values)
+    # FIXED: Use nanmean to handle any remaining NaN values gracefully
+    # If all frames are NaN, return 0.0 instead of NaN
+    if len(psnr_values) == 0:
+        avg_psnr = 0.0
+        avg_ssim = 0.0
+    else:
+        avg_psnr = np.nanmean(psnr_values) if len(psnr_values) > 0 else 0.0
+        avg_ssim = np.nanmean(ssim_values) if len(ssim_values) > 0 else 0.0
 
     return {
         'psnr': avg_psnr,

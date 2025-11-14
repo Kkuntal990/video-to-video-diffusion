@@ -714,7 +714,8 @@ def collate_variable_depth(batch: List[Dict]) -> Dict:
             # Pad along dimension 1 (depth): (pad_left, pad_right) for last 3 dims
             # For 4D: (W_left, W_right, H_left, H_right, D_left, D_right, C_left, C_right)
             # We want to pad depth (dim 1), so: (0, 0, 0, 0, 0, thick_padding, 0, 0)
-            thick_padded.append(F.pad(thick, (0, 0, 0, 0, 0, thick_padding), value=0))
+            # FIXED: Pad with -1.0 (air/background in CT) instead of 0 (mid-range intensity)
+            thick_padded.append(F.pad(thick, (0, 0, 0, 0, 0, thick_padding), value=-1.0))
         else:
             thick_padded.append(thick)
 
@@ -729,7 +730,8 @@ def collate_variable_depth(batch: List[Dict]) -> Dict:
         thin_depth = thin.shape[1]
         thin_padding = max_thin_depth - thin_depth
         if thin_padding > 0:
-            thin_padded.append(F.pad(thin, (0, 0, 0, 0, 0, thin_padding), value=0))
+            # FIXED: Pad with -1.0 (air/background in CT) instead of 0 (mid-range intensity)
+            thin_padded.append(F.pad(thin, (0, 0, 0, 0, 0, thin_padding), value=-1.0))
         else:
             thin_padded.append(thin)
 

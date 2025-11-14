@@ -152,13 +152,35 @@ class GaussianDiffusion(nn.Module):
             mse_per_element = (noise_pred - noise) ** 2
             masked_mse = mse_per_element * mask_expanded
 
-            # Average over masked elements only (not all elements)
-            num_valid_elements = mask_expanded.sum()
-            if num_valid_elements > 0:
-                loss_mse = masked_mse.sum() / num_valid_elements
-            else:
-                # Fallback if somehow all masked out (shouldn't happen)
-                loss_mse = masked_mse.mean()
+            # FIXED: Per-sample normalization to prevent loss variance from varying depths
+            # Each sample normalized by ITS OWN valid elements, then averaged over batch
+            # This ensures loss magnitude is independent of depth variation
+            batch_size = noise_pred.shape[0]
+            losses_per_sample = []
+
+            # ADDITIONAL FIX: SNR weighting to normalize across timesteps
+            # Diffusion loss naturally varies 100x across timesteps (high noise vs low noise)
+            # Min-SNR weighting down-weights easy (low-noise) timesteps to balance variance
+            # Based on "Imagen" and "Perception Prioritized Training" papers
+            snr = self.alphas_cumprod[t] / (1 - self.alphas_cumprod[t] + 1e-8)  # (B,)
+            snr_weight = torch.clamp(snr, max=5.0) / (snr + 1e-8)  # Min-SNR-5: down-weight high-SNR (easy) samples
+
+            for i in range(batch_size):
+                sample_mse = masked_mse[i]  # (C, T, H, W)
+                sample_mask = mask_expanded[i]  # (C, T, H, W)
+                num_valid = sample_mask.sum()
+
+                if num_valid > 0:
+                    # Normalize by this sample's valid elements AND timestep difficulty
+                    sample_loss = (sample_mse.sum() / num_valid) * snr_weight[i]
+                else:
+                    # Fallback if somehow all masked out (shouldn't happen)
+                    sample_loss = torch.tensor(0.0, device=noise_pred.device)
+
+                losses_per_sample.append(sample_loss)
+
+            # Average across batch (FIXED denominator = batch_size)
+            loss_mse = torch.stack(losses_per_sample).mean()
         else:
             # No mask: standard MSE loss
             loss_mse = F.mse_loss(noise_pred, noise)

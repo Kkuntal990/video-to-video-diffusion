@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: v2v-diffusion-visualization-job-v100
+  name: v2v-diffusion-visualization-job-a100
 spec:
   backoffLimit: 0  # Don't retry on failure
   template:
@@ -9,7 +9,7 @@ spec:
       labels:
         app: v2v-diffusion
         type: visualization-job
-        gpu: v100
+        gpu: a100
     spec:
       restartPolicy: Never
 
@@ -31,7 +31,7 @@ spec:
           echo ""
 
           # Find the best checkpoint
-          CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/ape_v2v_diffusion"
+          CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/slice_interp_full_medium"
 
           # Check if checkpoint directory exists
           if [ ! -d "$CHECKPOINT_DIR" ]; then
@@ -59,11 +59,11 @@ spec:
           echo "Generating visualizations for validation samples..."
           python scripts/visualize_samples.py \
             --checkpoint "$CHECKPOINT" \
-            --config config/cloud_train_config_a100.yaml \
+            --config config/slice_interpolation_full_medium.yaml \
             --output-dir /workspace/storage_a100/visualizations \
             --split val \
             --num-samples 10 \
-            --inference-steps 100
+            --inference-steps 20
 
           echo ""
           echo "Visualization completed!"

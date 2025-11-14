@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v2v-preprocessing-job-256
+spec:
+  template:
+    metadata:
+      labels:
+        app: v2v-diffusion
+        type: preprocessing-job
+        gpu: none
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: preprocessing
+        image: ghcr.io/kkuntal990/v2v-diffusion:256x256
+        imagePullPolicy: Always
+
+        # Preprocessing-only command (num_epochs=0 in config)
+        command: ["/bin/bash"]
+        args:
+        - "-c"
+        - |
+          echo "Starting CPU-only preprocessing..."
+          echo "Node: $(hostname)"
+          echo ""
+
+          # Run train.py with num_epochs=0 (exits after dataloader creation/preprocessing)
+          python train.py --config config/slice_interpolation_full_medium.yaml
+
+          echo "Preprocessing completed!"
+
+        resources:
+          requests:
+            memory: "16Gi"
+            cpu: "8"  # More CPU for faster preprocessing
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+
+        volumeMounts:
+        - name: storage
+          mountPath: /workspace/storage_a100
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TORCH_HOME
+          value: "/workspace/storage_a100/.cache/torch"
+        - name: HF_HOME
+          value: "/workspace/storage_a100/.cache/huggingface"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal-a100-shared  # Shared RWX storage for 256×256
