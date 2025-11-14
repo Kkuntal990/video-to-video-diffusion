@@ -430,6 +430,10 @@ class VideoVAE(nn.Module):
             # Input: (B, C, D, H, W) where C=1 (grayscale), D is depth (variable)
             # Output: (B, 4, D/4, H/8, W/8) - already scaled by MAISIVAE
 
+            # CRITICAL: Convert from [-1, 1] to [0, 1] for MAISI VAE
+            # MAISI was trained on [0, 1] range, but our diffusion uses [-1, 1]
+            x = (x + 1.0) / 2.0
+
             # For large volumes, process in chunks to reduce memory usage
             B, C, D, H, W = x.shape
             if D > chunk_size:
@@ -467,9 +471,14 @@ class VideoVAE(nn.Module):
             # For large latents, process in chunks to reduce memory usage
             B, C, d, h, w = z.shape
             if d > chunk_size:
-                return self._decode_chunked(z, chunk_size)
+                x_recon = self._decode_chunked(z, chunk_size)
             else:
-                return self.maisi_vae.decode(z)
+                x_recon = self.maisi_vae.decode(z)
+
+            # CRITICAL: Convert from [0, 1] to [-1, 1] for diffusion
+            # MAISI outputs [0, 1] range, but our diffusion uses [-1, 1]
+            x_recon = x_recon * 2.0 - 1.0
+            return x_recon
 
         elif self.use_maisi:
             return self._decode_with_maisi(z)
@@ -496,6 +505,10 @@ class VideoVAE(nn.Module):
         logger = logging.getLogger(__name__)
 
         B, C, D, H, W = x.shape
+
+        # Note: Conversion from [-1, 1] to [0, 1] is done in encode() before calling this
+        # Do NOT convert again here to avoid double conversion
+
         chunks = []
 
         # Log chunking info (only once per batch)
@@ -560,6 +573,9 @@ class VideoVAE(nn.Module):
 
         # Concatenate all chunks along depth dimension
         x = torch.cat(chunks, dim=2)  # (B, 1, D, H, W)
+
+        # Note: Conversion from [0, 1] to [-1, 1] is done in decode() after calling this
+        # Do NOT convert again here to avoid double conversion
 
         return x
 

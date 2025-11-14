@@ -298,7 +298,6 @@ watch -n 2 "kubectl exec $POD_NAME -- nvidia-smi --query-gpu=memory.used,memory.
 
 1. Do not create readme files while or after solving a task unless explicity asked to. 
 2. We have python environment ~/miniconda3/envs/ct-superres-mps/bin/python3
----
 
 **Last Updated**: November 9, 2025 by Claude
 **Status**: Production ready ✅

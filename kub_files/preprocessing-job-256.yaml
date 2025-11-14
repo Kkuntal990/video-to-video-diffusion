@@ -59,4 +59,4 @@ spec:
       volumes:
       - name: storage
         persistentVolumeClaim:
-          claimName: v2v-diffuser-kuntal-a100-shared  # Shared RWX storage for 256×256
+          claimName: v2v-diffuser-kuntal-a100  # Shared RWX storage for 256×256
