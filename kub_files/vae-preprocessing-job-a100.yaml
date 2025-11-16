@@ -42,20 +42,21 @@ spec:
           echo "=========================================="
           echo "STEP 1: Cleaning existing cache..."
           echo "=========================================="
-          CACHE_DIR="/workspace/storage_a100/.cache/slice_interpolation_cache"
+          PROCESSED_DIR="/workspace/storage_a100/.cache/processed"
+          EXTRACT_DIR="/workspace/storage_a100/.cache/slice_interpolation_cache"
 
-          if [ -d "$CACHE_DIR/processed" ]; then
+          if [ -d "$PROCESSED_DIR" ]; then
             echo "Removing existing processed cache..."
-            du -sh "$CACHE_DIR/processed" 2>/dev/null || echo "Cache doesn't exist yet"
-            rm -rf "$CACHE_DIR/processed"
-            echo "✓ Processed cache cleared"
+            du -sh "$PROCESSED_DIR" 2>/dev/null || echo "Cache doesn't exist yet"
+            rm -rf "$PROCESSED_DIR"
+            echo "✓ Processed cache cleared: $PROCESSED_DIR"
           else
-            echo "No existing processed cache found"
+            echo "No existing processed cache found at $PROCESSED_DIR"
           fi
 
-          if [ -d "$CACHE_DIR/extracted" ]; then
+          if [ -d "$EXTRACT_DIR/extracted" ]; then
             echo "Removing extraction cache..."
-            rm -rf "$CACHE_DIR/extracted"
+            rm -rf "$EXTRACT_DIR/extracted"
             echo "✓ Extraction cache cleared"
           fi
 
@@ -86,17 +87,17 @@ spec:
           echo "=========================================="
 
           # Count processed files
-          PROCESSED_COUNT=$(ls -1 "$CACHE_DIR/processed/"*.pt 2>/dev/null | wc -l)
+          PROCESSED_COUNT=$(ls -1 "$PROCESSED_DIR/"*.pt 2>/dev/null | wc -l)
           echo "Preprocessed files created: $PROCESSED_COUNT"
-          echo "Expected: 356 files (after excluding 19 corrupted cases)"
+          echo "Expected: ~437 files (456 total - 19 corrupted)"
           echo ""
 
           # Show file range
           echo "First 10 files:"
-          ls "$CACHE_DIR/processed/" | sort | head -10
+          ls "$PROCESSED_DIR/" | sort | head -10
           echo ""
           echo "Last 10 files:"
-          ls "$CACHE_DIR/processed/" | sort | tail -10
+          ls "$PROCESSED_DIR/" | sort | tail -10
           echo ""
 
           # Check for missing ranges
@@ -105,9 +106,9 @@ spec:
 import os
 from pathlib import Path
 
-cache_dir = Path("/workspace/storage_a100/.cache/slice_interpolation_cache/processed")
-if cache_dir.exists():
-    files = sorted(cache_dir.glob("case_*.pt"))
+processed_dir = Path("/workspace/storage_a100/.cache/processed")
+if processed_dir.exists():
+    files = sorted(processed_dir.glob("case_*.pt"))
     case_numbers = [int(f.stem.split('_')[1]) for f in files]
 
     if case_numbers:
@@ -135,18 +136,19 @@ EOF
           echo ""
 
           # Check cache size
-          if [ -d "$CACHE_DIR/processed" ]; then
+          if [ -d "$PROCESSED_DIR" ]; then
             echo "Cache size:"
-            du -sh "$CACHE_DIR/processed"
-            echo "Expected: ~100-120 GB for 356 patients"
+            du -sh "$PROCESSED_DIR"
+            echo "Expected: ~120-140 GB for ~437 patients"
           fi
 
           echo ""
 
           # Check for failures
-          if [ -f "$CACHE_DIR/preprocessing_failures.txt" ]; then
+          FAILURES_FILE="/workspace/storage_a100/.cache/preprocessing_failures.txt"
+          if [ -f "$FAILURES_FILE" ]; then
             echo "Preprocessing failures report:"
-            cat "$CACHE_DIR/preprocessing_failures.txt"
+            cat "$FAILURES_FILE"
           fi
 
           echo ""
