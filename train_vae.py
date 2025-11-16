@@ -151,12 +151,6 @@ class AutoencoderLoss(nn.Module):
             self.lambda_ssim * ssim_loss_val
         )
 
-        # Helper to extract scalar value (handles both tensors and floats)
-        def to_scalar(val):
-            if isinstance(val, torch.Tensor):
-                return val.item()
-            return float(val)
-
         loss_dict = {
             'loss': total_loss.item(),
             'recon_loss': recon_loss.item(),
@@ -165,6 +159,13 @@ class AutoencoderLoss(nn.Module):
         }
 
         return total_loss, loss_dict
+
+
+def to_scalar(val):
+    """Convert tensor or float to Python scalar"""
+    if isinstance(val, torch.Tensor):
+        return val.item()
+    return float(val)
 
 
 class VAETrainer:
@@ -312,7 +313,8 @@ class VAETrainer:
                 target_norm = (thick_slices + 1.0) / 2.0
 
                 psnr = calculate_psnr(recon_norm, target_norm, max_val=1.0)
-                epoch_psnr.append(psnr.item())
+                psnr_scalar = to_scalar(psnr)
+                epoch_psnr.append(psnr_scalar)
 
             epoch_losses.append(loss_dict['loss'])
 
@@ -320,7 +322,7 @@ class VAETrainer:
             pbar.set_postfix({
                 'loss': f"{loss_dict['loss']:.4f}",
                 'recon': f"{loss_dict['recon_loss']:.4f}",
-                'psnr': f"{psnr.item():.2f}",
+                'psnr': f"{psnr_scalar:.2f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
             })
 
@@ -330,7 +332,7 @@ class VAETrainer:
                     f"Step {self.global_step} | "
                     f"Loss: {loss_dict['loss']:.4f} | "
                     f"Recon: {loss_dict['recon_loss']:.4f} | "
-                    f"PSNR: {psnr.item():.2f} dB"
+                    f"PSNR: {psnr_scalar:.2f} dB"
                 )
 
         # Epoch summary
@@ -383,8 +385,8 @@ class VAETrainer:
             psnr = calculate_psnr(recon_norm, target_norm, max_val=1.0)
             ssim = calculate_ssim(recon_norm, target_norm, max_val=1.0)
 
-            val_psnr.append(psnr.item())
-            val_ssim.append(ssim.item())
+            val_psnr.append(to_scalar(psnr))
+            val_ssim.append(to_scalar(ssim))
 
         # Compute averages
         avg_loss = sum(val_losses) / len(val_losses)
