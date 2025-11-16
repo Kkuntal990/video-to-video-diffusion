@@ -24,8 +24,8 @@ data:
 
   # Full-volume configuration
   use_full_volumes: true
-  max_thick_slices: 50
-  max_thin_slices: 300
+  max_thick_slices: 40  # Reduced from 50 for memory (20% reduction)
+  max_thin_slices: 240  # Reduced from 300 for memory (20% reduction)
   resolution: [512, 512]
 
   # CT windowing
@@ -45,7 +45,7 @@ data:
 
 # VAE Training Configuration
 training:
-  num_epochs: 20  # VAEs converge quickly
+  num_epochs: 50  # VAEs converge quickly
   learning_rate: 0.0001  # 1e-4
   weight_decay: 0.01
 
@@ -96,7 +96,8 @@ losses:
   lambda_kl: 0.00001  # Very small to avoid posterior collapse
 
   # Perceptual loss (optional, helps quality)
-  use_perceptual_loss: true
+  # DISABLED temporarily to save memory (VGG network is memory-intensive)
+  use_perceptual_loss: false
   lambda_perceptual: 0.1
   perceptual_every_n_steps: 10
 

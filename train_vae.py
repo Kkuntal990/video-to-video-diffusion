@@ -307,6 +307,10 @@ class VAETrainer:
 
                 self.global_step += 1
 
+                # Clear GPU cache periodically to prevent fragmentation
+                if self.global_step % 100 == 0:
+                    torch.cuda.empty_cache()
+
             # Compute metrics
             with torch.no_grad():
                 # Convert to [0, 1] for PSNR and SSIM
@@ -521,6 +525,9 @@ class VAETrainer:
             if epoch % val_interval == 0:
                 logger.info(f"Running validation for epoch {epoch}...")
                 val_loss, val_psnr, val_ssim = self.validate(val_loader, epoch)
+
+                # Clear GPU cache after validation to free memory
+                torch.cuda.empty_cache()
 
                 # Save checkpoint
                 is_best = val_psnr > best_psnr
