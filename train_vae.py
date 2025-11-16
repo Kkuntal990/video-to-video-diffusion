@@ -458,18 +458,60 @@ class VAETrainer:
                 old_ckpt.unlink()
                 logger.info(f"Deleted old checkpoint: {old_ckpt}")
 
-    def train(self, train_loader, val_loader):
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint and resume training"""
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Load model state
+        self.vae.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("✓ Loaded VAE model state")
+
+        # Load optimizer state
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        logger.info("✓ Loaded optimizer state")
+
+        # Load scheduler state if exists
+        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info("✓ Loaded scheduler state")
+
+        # Load scaler state if exists
+        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            logger.info("✓ Loaded gradient scaler state")
+
+        # Restore training state
+        self.global_step = checkpoint.get('global_step', 0)
+        self.current_epoch = checkpoint.get('epoch', 0)
+
+        val_psnr = checkpoint.get('val_psnr', 0.0)
+
+        logger.info(f"✓ Resumed from epoch {self.current_epoch}, step {self.global_step}")
+        logger.info(f"  Previous best PSNR: {val_psnr:.2f} dB")
+
+        return val_psnr
+
+    def train(self, train_loader, val_loader, initial_best_psnr=0.0):
         """Main training loop"""
         num_epochs = self.config['training']['num_epochs']
         val_interval = self.config['training'].get('val_interval', 1)
 
-        best_psnr = 0.0
+        best_psnr = initial_best_psnr
 
-        logger.info(f"Starting VAE training for {num_epochs} epochs...")
+        start_epoch = self.current_epoch + 1 if self.current_epoch > 0 else 1
+
+        if start_epoch > 1:
+            logger.info(f"Resuming VAE training from epoch {start_epoch} to {num_epochs}...")
+            logger.info(f"Previous best PSNR: {best_psnr:.2f} dB")
+        else:
+            logger.info(f"Starting VAE training for {num_epochs} epochs...")
+
         logger.info(f"Total training samples: {len(train_loader.dataset)}")
         logger.info(f"Total validation samples: {len(val_loader.dataset)}")
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             self.current_epoch = epoch
 
             # Train
@@ -503,6 +545,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train custom VAE for CT slice interpolation')
     parser.add_argument('--config', type=str, default='config/vae_training.yaml',
                        help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from (e.g., /workspace/storage_a100/checkpoints/vae_training/vae_best.pt)')
     args = parser.parse_args()
 
     # Load config
@@ -577,8 +621,18 @@ def main():
     # Create trainer
     trainer = VAETrainer(config, device)
 
+    # Load checkpoint if resuming
+    initial_best_psnr = 0.0
+    if args.resume:
+        if not os.path.exists(args.resume):
+            logger.error(f"Checkpoint not found: {args.resume}")
+            logger.error("Please provide a valid checkpoint path with --resume")
+            return
+
+        initial_best_psnr = trainer.load_checkpoint(args.resume)
+
     # Train
-    trainer.train(train_loader, val_loader)
+    trainer.train(train_loader, val_loader, initial_best_psnr=initial_best_psnr)
 
 
 if __name__ == '__main__':
