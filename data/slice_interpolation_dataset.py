@@ -656,17 +656,11 @@ class SliceInterpolationDataset(Dataset):
             sample_dict = torch.load(processed_file, weights_only=False)
             return sample_dict
         except Exception as e:
-            logger.error(f"Error loading {processed_file}: {e}")
-            logger.warning(f"Skipping corrupted file and trying next sample (retry {_retry_count + 1}/10)")
+            # Log error only on first retry to avoid spam
+            if _retry_count == 0:
+                logger.warning(f"Skipping corrupted file {patient_info['patient_id']}: {str(e)[:100]}")
 
-            # Try to delete corrupted file to free up space and prevent future issues
-            try:
-                processed_file.unlink()
-                logger.info(f"Deleted corrupted file: {processed_file}")
-            except Exception as del_err:
-                logger.warning(f"Could not delete corrupted file: {del_err}")
-
-            # Return next sample on error with retry counter
+            # Skip to next sample (needed because DataLoader requires valid return)
             next_idx = (idx + 1) % len(self.patient_files)
             return self.__getitem__(next_idx, _retry_count=_retry_count + 1)
 
