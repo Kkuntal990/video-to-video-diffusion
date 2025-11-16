@@ -231,6 +231,9 @@ def test_multiple_patients(model, processed_dir, num_samples=5):
     print(f"TEST 3: Multiple Patient Consistency ({num_samples} patients)")
     print(f"{'='*70}")
 
+    # Get device from model
+    device = next(model.parameters()).device
+
     processed_dir = Path(processed_dir)
     pt_files = sorted(list(processed_dir.glob('*.pt')))[:num_samples]
 
