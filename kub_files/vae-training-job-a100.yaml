@@ -17,21 +17,46 @@ spec:
         image: ghcr.io/kkuntal990/v2v-diffusion:latest
         imagePullPolicy: Always
 
-        # VAE training command
         command: ["/bin/bash"]
         args:
         - "-c"
         - |
-          echo "Starting training on A100 80GB..."
+          echo "=========================================="
+          echo "VAE Training on A100 80GB"
+          echo "=========================================="
           echo "GPU Info:"
           nvidia-smi
           echo ""
           echo "Node: $(hostname)"
           echo ""
 
-          python train_vae.py --config config/vae_training.yaml
+          # Smart resume: check if checkpoint exists
+          CHECKPOINT_PATH="/workspace/storage_a100/checkpoints/vae_training/vae_best.pt"
 
+          if [ -f "$CHECKPOINT_PATH" ]; then
+            echo "✓ Found checkpoint: $CHECKPOINT_PATH"
+            echo "✓ Resuming training from best checkpoint..."
+            echo ""
+
+            # Resume training
+            python train_vae.py \
+              --config config/vae_training.yaml \
+              --resume "$CHECKPOINT_PATH"
+
+          else
+            echo "⚠ No checkpoint found at $CHECKPOINT_PATH"
+            echo "✓ Starting fresh VAE training..."
+            echo ""
+
+            # Start fresh training
+            python train_vae.py \
+              --config config/vae_training.yaml
+          fi
+
+          echo ""
+          echo "=========================================="
           echo "VAE training completed!"
+          echo "=========================================="
 
         resources:
           requests:
@@ -65,7 +90,7 @@ spec:
       volumes:
       - name: storage
         persistentVolumeClaim:
-          claimName: v2v-diffuser-kuntal-a100-shared 
+          claimName: v2v-diffuser-kuntal-a100-shared
       - name: dshm
         emptyDir:
           medium: Memory
