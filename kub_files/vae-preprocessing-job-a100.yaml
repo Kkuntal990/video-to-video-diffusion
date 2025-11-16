@@ -14,7 +14,7 @@ spec:
 
       containers:
       - name: vae-preprocessing
-        image: kuntalkokate/llm_agent_v2v_train:latest
+        image: ghcr.io/kkuntal990/v2v-diffusion:latest
         imagePullPolicy: Always
 
         # Preprocessing-only command
