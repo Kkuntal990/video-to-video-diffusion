@@ -41,21 +41,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def check_nan_and_visualize(tensor, name="tensor"):
+    """
+    Check for NaN values and return statistics
+
+    Args:
+        tensor: torch tensor to check
+        name: name for logging
+
+    Returns:
+        has_nan: bool, whether NaN values exist
+        nan_count: number of NaN values
+        total: total number of elements
+    """
+    nan_count = torch.isnan(tensor).sum().item()
+    total = tensor.numel()
+    if nan_count > 0:
+        percentage = 100 * nan_count / total
+        logger.warning(f"⚠ {name} contains {nan_count}/{total} ({percentage:.1f}%) NaN values!")
+        return True, nan_count, total
+    return False, 0, total
+
+
 def tensor_to_image(tensor):
     """
     Convert tensor to numpy image
 
     Args:
-        tensor: (C, H, W) tensor in range [0, 1]
+        tensor: (C, H, W) tensor in range [-1, 1]
+               C=1 for grayscale (medical imaging), C=3 for RGB
 
     Returns:
         image: (H, W, C) numpy array in range [0, 255]
+               For grayscale, C=3 (repeated for visualization)
     """
+    # Normalize from [-1, 1] to [0, 1]
+    tensor = (tensor + 1.0) / 2.0
+
     # Clamp to [0, 1]
     tensor = torch.clamp(tensor, 0, 1)
 
     # Convert to numpy: (C, H, W) -> (H, W, C)
     image = tensor.cpu().numpy().transpose(1, 2, 0)
+
+    # If grayscale (C=1), repeat to RGB for visualization
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)  # (H, W, 1) -> (H, W, 3)
 
     # Convert to [0, 255]
     image = (image * 255).astype(np.uint8)
@@ -101,6 +132,9 @@ def create_comparison_grid(input_video, gt_video, pred_video, save_path, sample_
     """
     C, T, H, W = input_video.shape
 
+    # Check for NaN in prediction
+    has_nan = torch.isnan(pred_video).any()
+
     # Select middle frame and first/last for visualization
     frame_indices = [0, T//2, T-1]
 
@@ -126,12 +160,28 @@ def create_comparison_grid(input_video, gt_video, pred_video, save_path, sample_
         if row_idx == 0:
             axes[row_idx, 1].set_title(col_labels[1], fontsize=14, fontweight='bold')
 
-        # Prediction frame
+        # Prediction frame with NaN overlay
         pred_img = tensor_to_image(pred_video[:, t, :, :])
         axes[row_idx, 2].imshow(pred_img, cmap='gray' if C == 1 else None)
+
+        # Overlay NaN mask in red if NaN detected
+        if has_nan:
+            nan_mask = torch.isnan(pred_video[:, t, :, :]).cpu().numpy()
+            if nan_mask.shape[0] == 1:  # Grayscale
+                nan_mask = nan_mask[0]
+            else:
+                nan_mask = nan_mask.max(axis=0)
+
+            # Create red overlay
+            axes[row_idx, 2].imshow(nan_mask, cmap='Reds', alpha=0.5, vmin=0, vmax=1)
+
         axes[row_idx, 2].axis('off')
         if row_idx == 0:
-            axes[row_idx, 2].set_title(col_labels[2], fontsize=14, fontweight='bold')
+            title = col_labels[2]
+            if has_nan:
+                title += ' ⚠ NaN DETECTED'
+            axes[row_idx, 2].set_title(title, fontsize=14, fontweight='bold',
+                                      color='red' if has_nan else 'black')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -204,7 +254,29 @@ def visualize_samples(
 
             # Generate predictions
             logger.info(f"\nProcessing batch {batch_idx + 1}...")
-            v_pred = model.generate(v_in, sampler='ddim', num_inference_steps=num_inference_steps)
+            logger.info(f"  Input shape: {v_in.shape}, Target shape: {v_gt.shape}")
+
+            # Get target depth for slice interpolation
+            target_depth = v_gt.shape[2]
+            logger.info(f"  Target depth: {target_depth} slices")
+
+            # Generate with DDIM sampler
+            logger.info(f"  Generating predictions with DDIM ({num_inference_steps} steps)...")
+            v_pred = model.generate(
+                v_in,
+                sampler='ddim',
+                num_inference_steps=num_inference_steps,
+                target_depth=target_depth  # Pass target depth for slice interpolation
+            )
+
+            # Check predictions for NaN
+            logger.info(f"  Checking predictions for NaN values...")
+            has_nan, nan_count, total = check_nan_and_visualize(v_pred, "Predictions")
+            if has_nan:
+                logger.error(f"  ❌ PREDICTION CONTAINS NaN! ({nan_count}/{total} pixels = {100*nan_count/total:.1f}%)")
+                logger.error(f"  This indicates a problem in the diffusion sampling or VAE decoding!")
+            else:
+                logger.info(f"  ✓ Predictions are valid (no NaN values)")
 
             # Process each sample in batch
             batch_size = v_in.size(0)

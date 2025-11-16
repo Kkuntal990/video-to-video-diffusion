@@ -2,6 +2,17 @@
 Main training script for Video-to-Video Diffusion Model
 """
 
+import warnings
+import logging
+
+# Suppress pydicom warnings about character encodings (GB18030, etc.)
+# These are harmless warnings from DICOM files with Chinese text
+warnings.filterwarnings('ignore', message='.*cannot be used as code extension.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='pydicom')
+
+# Also suppress pydicom logging warnings
+logging.getLogger('pydicom').setLevel(logging.ERROR)
+
 import torch
 import argparse
 import yaml
@@ -53,12 +64,13 @@ def main(args):
 
     # Create model
     logger.info("Creating model...")
-    model = VideoToVideoDiffusion(config['model'])
+    model = VideoToVideoDiffusion(config)
 
     # Count parameters
     param_counts = model.count_parameters()
     logger.info(f"Total parameters: {param_counts['total']:,}")
-    logger.info(f"  VAE: {param_counts['vae']:,}")
+    logger.info(f"  Trainable: {param_counts['trainable']:,}")
+    logger.info(f"  VAE: {param_counts['vae']:,} ({param_counts['vae_trainable']:,} trainable)")
     logger.info(f"  U-Net: {param_counts['unet']:,}")
 
     # Load pretrained VAE weights if configured
@@ -71,7 +83,8 @@ def main(args):
         )
 
         vae_config = config['pretrained'].get('vae', {})
-        if vae_config.get('enabled', False):
+        # Skip if using custom MAISI VAE (weights already loaded in model constructor)
+        if vae_config.get('enabled', False) and not vae_config.get('use_custom_maisi', False):
             model_name = vae_config.get('model_name', 'hpcai-tech/OpenSora-VAE-v1.2')
             inflate_method = vae_config.get('inflate_method', 'central')
 
@@ -136,26 +149,51 @@ def main(args):
     vae_decoder_mult = lr_multipliers.get('vae_decoder', 1.0)
     unet_mult = lr_multipliers.get('unet', 1.0)
 
-    # VAE encoder parameters
-    param_groups.append({
-        'params': model.vae.encoder.parameters(),
-        'lr': base_lr * vae_encoder_mult,
-        'name': 'vae_encoder'
-    })
+    # VAE encoder/decoder parameters - handle custom MAISI VAE structure
+    # CRITICAL: Only include parameters with requires_grad=True to avoid GradScaler errors
+    if hasattr(model.vae, 'maisi_vae') and model.vae.maisi_vae is not None:
+        # Custom MAISI VAE: encoder/decoder are nested in maisi_vae
+        vae_encoder_params = [p for p in model.vae.maisi_vae.encoder.parameters() if p.requires_grad]
+        if vae_encoder_params:
+            param_groups.append({
+                'params': vae_encoder_params,
+                'lr': base_lr * vae_encoder_mult,
+                'name': 'vae_encoder'
+            })
 
-    # VAE decoder parameters
-    param_groups.append({
-        'params': model.vae.decoder.parameters(),
-        'lr': base_lr * vae_decoder_mult,
-        'name': 'vae_decoder'
-    })
+        vae_decoder_params = [p for p in model.vae.maisi_vae.decoder.parameters() if p.requires_grad]
+        if vae_decoder_params:
+            param_groups.append({
+                'params': vae_decoder_params,
+                'lr': base_lr * vae_decoder_mult,
+                'name': 'vae_decoder'
+            })
+    else:
+        # Regular VAE: encoder/decoder are direct attributes
+        vae_encoder_params = [p for p in model.vae.encoder.parameters() if p.requires_grad]
+        if vae_encoder_params:
+            param_groups.append({
+                'params': vae_encoder_params,
+                'lr': base_lr * vae_encoder_mult,
+                'name': 'vae_encoder'
+            })
 
-    # U-Net parameters
-    param_groups.append({
-        'params': model.unet.parameters(),
-        'lr': base_lr * unet_mult,
-        'name': 'unet'
-    })
+        vae_decoder_params = [p for p in model.vae.decoder.parameters() if p.requires_grad]
+        if vae_decoder_params:
+            param_groups.append({
+                'params': vae_decoder_params,
+                'lr': base_lr * vae_decoder_mult,
+                'name': 'vae_decoder'
+            })
+
+    # U-Net parameters - filter to trainable only for consistency
+    unet_params = [p for p in model.unet.parameters() if p.requires_grad]
+    if unet_params:
+        param_groups.append({
+            'params': unet_params,
+            'lr': base_lr * unet_mult,
+            'name': 'unet'
+        })
 
     if optimizer_name == 'adam':
         optimizer = torch.optim.Adam(param_groups, weight_decay=weight_decay)
@@ -165,9 +203,11 @@ def main(args):
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
     logger.info(f"Optimizer: {optimizer_name}, Base LR: {base_lr}")
-    logger.info(f"  VAE Encoder LR: {base_lr * vae_encoder_mult}")
-    logger.info(f"  VAE Decoder LR: {base_lr * vae_decoder_mult}")
-    logger.info(f"  U-Net LR: {base_lr * unet_mult}")
+    logger.info(f"Optimizer param groups: {len(param_groups)}")
+    for i, pg in enumerate(param_groups):
+        num_params = sum(p.numel() for p in pg['params'])
+        logger.info(f"  Group {i} ({pg.get('name', 'unnamed')}): {num_params:,} params, LR: {pg['lr']:.2e}")
+    logger.info(f"Note: VAE frozen param groups are excluded from optimizer")
 
     # Create scheduler
     scheduler_config = {

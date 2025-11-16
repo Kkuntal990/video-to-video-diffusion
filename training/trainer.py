@@ -157,6 +157,12 @@ class Trainer:
     def train_epoch(self):
         """Train for one epoch"""
         self.model.train()
+
+        # Clear any leftover accumulated gradients from previous epoch
+        # This is critical when gradient_accumulation_steps doesn't divide evenly into num_batches
+        # Example: 243 batches % 8 steps = 3 leftover batches that never called optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
         epoch_losses = []  # Store loss tensors to avoid repeated CPU-GPU sync
         epoch_loss_sum = 0.0
         epoch_loss_count = 0
@@ -168,13 +174,19 @@ class Trainer:
             v_in = batch['input'].to(self.device)
             v_gt = batch['target'].to(self.device)
 
+            # Extract padding mask for target (thin slices) - CRITICAL for variable depths!
+            # Prevents model from learning on zero-padded regions
+            mask = batch.get('thin_mask', None)
+            if mask is not None:
+                mask = mask.to(self.device)
+
             # Forward pass with mixed precision
             if self.use_amp:
                 with autocast():
-                    loss, metrics = self.model(v_in, v_gt)
+                    loss, metrics = self.model(v_in, v_gt, mask=mask)
                     loss = loss / self.gradient_accumulation_steps
             else:
-                loss, metrics = self.model(v_in, v_gt)
+                loss, metrics = self.model(v_in, v_gt, mask=mask)
                 loss = loss / self.gradient_accumulation_steps
 
             # Backward pass
@@ -229,6 +241,19 @@ class Trainer:
                 step_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_step_{self.global_step}.pt')
                 self.save_checkpoint(step_checkpoint_filename)
 
+        # Handle any remaining accumulated gradients at end of epoch
+        # If num_batches % gradient_accumulation_steps != 0, there will be leftover gradients
+        # Example: 243 batches % 8 = 3 leftover batches that accumulated but never stepped
+        num_batches = len(self.train_dataloader)
+        if num_batches % self.gradient_accumulation_steps != 0:
+            # Step the optimizer with remaining accumulated gradients
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
         # Average epoch loss (convert to scalar only once at end of epoch)
         if epoch_loss_count > 0:
             avg_loss = (epoch_loss_sum / epoch_loss_count).item()
@@ -256,9 +281,14 @@ class Trainer:
         ssim_sum = 0.0
         val_count = 0
 
-        pbar = tqdm(self.val_dataloader, desc="Validation")
+        # Limit validation samples for speed (config parameter)
+        max_samples = self.config.get('num_validation_samples', 2)
+        pbar = tqdm(self.val_dataloader, desc="Validation", total=min(max_samples, len(self.val_dataloader)))
 
         for batch in pbar:
+            # Stop after max_samples to speed up validation
+            if val_count >= max_samples:
+                break
             v_in = batch['input'].to(self.device)
             v_gt = batch['target'].to(self.device)
 
@@ -272,18 +302,22 @@ class Trainer:
             # Generate prediction for SSIM/PSNR calculation
             # Sample from the diffusion model using generate() method
             try:
+                # For slice interpolation, pass target depth from ground truth
+                target_depth = v_gt.shape[2]  # Get depth from ground truth (300 thin slices)
+
                 if self.use_amp:
                     with autocast():
-                        v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=50)
+                        v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
                 else:
-                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=50)
+                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
 
                 # Calculate SSIM and PSNR metrics
-                # Clamp values to [0, 1] range for metric calculation
-                v_pred_clamped = torch.clamp(v_pred, 0, 1)
-                v_gt_clamped = torch.clamp(v_gt, 0, 1)
+                # Clamp values to [-1, 1] range (matching dataset normalization)
+                v_pred_clamped = torch.clamp(v_pred, -1, 1)
+                v_gt_clamped = torch.clamp(v_gt, -1, 1)
 
-                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=1.0)
+                # PSNR max_val should be range size: 2.0 for [-1, 1]
+                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
                 psnr_sum += video_metrics['psnr']
                 ssim_sum += video_metrics['ssim']
             except Exception as e:
@@ -401,6 +435,13 @@ class Trainer:
         elapsed_time = time.time() - start_time
         print(f"\nTraining complete! Total time: {elapsed_time / 3600:.2f} hours")
 
+        # Run final validation to get end-of-training metrics
+        if self.val_dataloader:
+            print("\nRunning final validation...")
+            final_val_loss = self.validate()
+            self.writer.add_scalar('val/final_loss', final_val_loss, self.global_step)
+            print(f"Final validation loss: {final_val_loss:.4f}")
+
         # Save final checkpoint
         final_checkpoint_filename = self._get_checkpoint_filename('checkpoint_final.pt')
         self.save_checkpoint(final_checkpoint_filename)
@@ -417,6 +458,7 @@ class Trainer:
             path,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
+            scaler=self.scaler,  # CRITICAL: Save GradScaler state for stable AMP resume
             epoch=self.current_epoch,
             global_step=self.global_step,
             current_phase=self.current_phase,
@@ -437,6 +479,66 @@ class Trainer:
         self.model = loaded_model
         print(f"✓ Model weights loaded successfully")
 
+        # CRITICAL: Update optimizer param_groups to reference NEW model parameters
+        # The old optimizer was created with the old model before load!
+        # We need to rebuild param_groups with the new model's parameters
+        self.optimizer.param_groups.clear()
+
+        # Rebuild param_groups based on training config
+        base_lr = self.config.get('learning_rate', 1e-4)
+        weight_decay = self.config.get('weight_decay', 0.01)
+
+        # Get learning rate multipliers from config
+        unet_mult = self.config.get('unet_lr_mult', 1.0)
+        vae_encoder_mult = self.config.get('vae_encoder_lr_mult', 0.1)
+        vae_decoder_mult = self.config.get('vae_decoder_lr_mult', 0.1)
+
+        # VAE encoder parameters (if trainable)
+        # Handle different VAE architectures
+        vae_encoder_params = []
+        vae_decoder_params = []
+
+        if hasattr(self.model.vae, 'use_custom_maisi') and self.model.vae.use_custom_maisi:
+            # Custom MAISI VAE: encoder/decoder under maisi_vae
+            if hasattr(self.model.vae.maisi_vae, 'encoder'):
+                vae_encoder_params = [p for p in self.model.vae.maisi_vae.encoder.parameters() if p.requires_grad]
+            if hasattr(self.model.vae.maisi_vae, 'decoder'):
+                vae_decoder_params = [p for p in self.model.vae.maisi_vae.decoder.parameters() if p.requires_grad]
+        elif hasattr(self.model.vae, 'use_maisi') and self.model.vae.use_maisi:
+            # MONAI MAISI VAE: no separate encoder/decoder access
+            # Skip adding separate param groups for encoder/decoder
+            pass
+        else:
+            # Standard VAE or MAISI-arch: encoder/decoder directly accessible
+            if hasattr(self.model.vae, 'encoder'):
+                vae_encoder_params = [p for p in self.model.vae.encoder.parameters() if p.requires_grad]
+            if hasattr(self.model.vae, 'decoder'):
+                vae_decoder_params = [p for p in self.model.vae.decoder.parameters() if p.requires_grad]
+
+        if vae_encoder_params:
+            self.optimizer.add_param_group({
+                'params': vae_encoder_params,
+                'lr': base_lr * vae_encoder_mult,
+                'name': 'vae_encoder'
+            })
+
+        # VAE decoder parameters (if trainable)
+        if vae_decoder_params:
+            self.optimizer.add_param_group({
+                'params': vae_decoder_params,
+                'lr': base_lr * vae_decoder_mult,
+                'name': 'vae_decoder'
+            })
+
+        # U-Net parameters (should always be trainable)
+        unet_params = [p for p in self.model.unet.parameters() if p.requires_grad]
+        if unet_params:
+            self.optimizer.add_param_group({
+                'params': unet_params,
+                'lr': base_lr * unet_mult,
+                'name': 'unet'
+            })
+
         # Restore optimizer state
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -446,6 +548,11 @@ class Trainer:
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             print(f"✓ Scheduler state restored")
+
+        # Restore GradScaler state (CRITICAL for mixed precision training!)
+        if 'scaler_state_dict' in checkpoint and self.scaler is not None:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            print(f"✓ GradScaler state restored (scale={self.scaler.get_scale():.0f})")
 
         # Restore training state
         if 'epoch' in checkpoint:
@@ -478,6 +585,11 @@ class Trainer:
                 print("🔓 VAE unfrozen")
 
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+
+        # DEFENSIVE: Explicitly clear any stale gradients from loaded optimizer state
+        # This ensures clean slate even if optimizer state contained accumulated gradients
+        self.optimizer.zero_grad(set_to_none=True)
+        print(f"✓ Gradients cleared after checkpoint load")
 
 
 if __name__ == "__main__":

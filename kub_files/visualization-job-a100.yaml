@@ -23,7 +23,7 @@ spec:
         args:
         - "-c"
         - |
-          echo "Starting visualization on A100 80GB..."
+          echo "Starting visualization on Tesla V100-SXM2-32GB..."
           echo "GPU Info:"
           nvidia-smi
           echo ""
@@ -31,7 +31,7 @@ spec:
           echo ""
 
           # Find the best checkpoint
-          CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/ape_v2v_diffusion"
+          CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/slice_interp_full_medium"
 
           # Check if checkpoint directory exists
           if [ ! -d "$CHECKPOINT_DIR" ]; then
@@ -59,11 +59,11 @@ spec:
           echo "Generating visualizations for validation samples..."
           python scripts/visualize_samples.py \
             --checkpoint "$CHECKPOINT" \
-            --config config/cloud_train_config_a100.yaml \
+            --config config/slice_interpolation_full_medium.yaml \
             --output-dir /workspace/storage_a100/visualizations \
             --split val \
             --num-samples 10 \
-            --inference-steps 50
+            --inference-steps 20
 
           echo ""
           echo "Visualization completed!"
@@ -71,16 +71,17 @@ spec:
           echo ""
           echo "To download locally:"
           echo "  kubectl cp <pod-name>:/workspace/storage_a100/visualizations ./visualizations"
+          sleep 360
 
         resources:
           requests:
-            memory: "32Gi"
+            memory: "16Gi"
             cpu: "4"
-            nvidia.com/a100: "1"
+            nvidia.com/gpu: "1"
           limits:
-            memory: "32Gi"
+            memory: "16Gi"
             cpu: "4"
-            nvidia.com/a100: "1"
+            nvidia.com/gpu: "1"
 
         volumeMounts:
         - name: storage
@@ -110,7 +111,7 @@ spec:
           medium: Memory
           sizeLimit: "16Gi"
 
-      # Tolerations for A100 GPU nodes
+      # Tolerations for V100 GPU nodes
       tolerations:
       - effect: NoSchedule
         key: nautilus.io/hardware
@@ -120,7 +121,7 @@ spec:
         key: nvidia.com/gpu
         operator: Exists
 
-      # Node affinity for 80GB A100
+      # Node affinity for Tesla V100-SXM2-32GB
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -129,4 +130,4 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A100-SXM4-80GB
+                - Tesla-V100-SXM2-32GB

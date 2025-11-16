@@ -143,8 +143,10 @@ class DDIMSampler:
 
             z_0_pred = (z - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
 
-            # Clip z_0 prediction
-            z_0_pred = torch.clamp(z_0_pred, -1.0, 1.0)
+            # DO NOT clamp latents - VAE latent space is NOT bounded to [-1, 1]
+            # MAISI VAE uses scaling_factor=0.18215, so latents can range [-5, 5] or wider
+            # Clamping destroys the latent structure and causes poor reconstruction quality
+            # z_0_pred = torch.clamp(z_0_pred, -1.0, 1.0)  # REMOVED - corrupts latents
 
             # Compute direction pointing to z_t
             sqrt_alpha_t_prev = torch.sqrt(alpha_t_prev)

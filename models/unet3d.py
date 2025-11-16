@@ -10,6 +10,7 @@ Predicts noise in latent space conditioned on:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import math
 from einops import rearrange
 
@@ -53,8 +54,18 @@ class Conv3DBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
-        self.norm = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        # Adaptive group normalization: use 8 groups if possible, otherwise use max divisor
+        num_groups = min(8, out_channels) if out_channels % 8 == 0 else self._get_num_groups(out_channels)
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
         self.act = nn.SiLU()
+
+    @staticmethod
+    def _get_num_groups(channels):
+        """Find largest divisor of channels that's <= 32"""
+        for groups in [32, 16, 8, 4, 2, 1]:
+            if channels % groups == 0:
+                return groups
+        return 1
 
     def forward(self, x):
         x = self.conv(x)
@@ -79,9 +90,11 @@ class ResBlock3D(nn.Module):
             nn.Linear(time_dim, out_channels)
         )
 
+        # Adaptive group norm for conv2
+        num_groups = self._get_num_groups(out_channels)
         self.conv2 = nn.Sequential(
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=out_channels)
+            nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
         )
 
         # Residual connection
@@ -91,6 +104,14 @@ class ResBlock3D(nn.Module):
             self.residual_conv = nn.Identity()
 
         self.act = nn.SiLU()
+
+    @staticmethod
+    def _get_num_groups(channels):
+        """Find largest divisor of channels that's <= 32"""
+        for groups in [32, 16, 8, 4, 2, 1]:
+            if channels % groups == 0:
+                return groups
+        return 1
 
     def forward(self, x, time_emb):
         residual = self.residual_conv(x)
@@ -125,9 +146,19 @@ class TemporalAttention(nn.Module):
 
         assert channels % num_heads == 0, "channels must be divisible by num_heads"
 
-        self.norm = nn.GroupNorm(num_groups=8, num_channels=channels)
+        # Adaptive group norm
+        num_groups = self._get_num_groups(channels)
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
         self.qkv = nn.Conv3d(channels, channels * 3, kernel_size=1)
         self.proj_out = nn.Conv3d(channels, channels, kernel_size=1)
+
+    @staticmethod
+    def _get_num_groups(channels):
+        """Find largest divisor of channels that's <= 32"""
+        for groups in [32, 16, 8, 4, 2, 1]:
+            if channels % groups == 0:
+                return groups
+        return 1
 
     def forward(self, x):
         B, C, T, H, W = x.shape
@@ -208,7 +239,7 @@ class UNet3D(nn.Module):
 
     def __init__(self, latent_dim=4, model_channels=128, num_res_blocks=2,
                  attention_levels=[1, 2], channel_mult=(1, 2, 4, 4),
-                 num_heads=4, time_embed_dim=512):
+                 num_heads=4, time_embed_dim=512, use_checkpoint=False):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -217,6 +248,7 @@ class UNet3D(nn.Module):
         self.attention_levels = attention_levels
         self.channel_mult = channel_mult
         self.num_levels = len(channel_mult)
+        self.use_checkpoint = use_checkpoint  # Enable gradient checkpointing to save memory
 
         # Time embedding
         self.time_embed = TimeEmbedding(model_channels, time_embed_dim)
@@ -291,11 +323,36 @@ class UNet3D(nn.Module):
                 self.up_samples.append(nn.Identity())
 
         # Output projection
+        # Adaptive group norm for output
+        output_num_groups = self._get_num_groups(ch)
         self.conv_out = nn.Sequential(
-            nn.GroupNorm(num_groups=8, num_channels=ch),
+            nn.GroupNorm(num_groups=output_num_groups, num_channels=ch),
             nn.SiLU(),
             nn.Conv3d(ch, latent_dim, kernel_size=3, padding=1)
         )
+
+    @staticmethod
+    def _get_num_groups(channels):
+        """Find largest divisor of channels that's <= 32"""
+        for groups in [32, 16, 8, 4, 2, 1]:
+            if channels % groups == 0:
+                return groups
+        return 1
+
+    def _checkpoint_forward(self, module, *args):
+        """
+        Helper to conditionally apply gradient checkpointing.
+
+        Gradient checkpointing trades compute for memory by not storing
+        intermediate activations during forward pass, recomputing them
+        during backward pass instead.
+        """
+        if self.use_checkpoint and self.training:
+            return torch.utils.checkpoint.checkpoint(
+                module, *args, use_reentrant=False
+            )
+        else:
+            return module(*args)
 
     def forward(self, x, t, c):
         """
@@ -322,17 +379,17 @@ class UNet3D(nn.Module):
             for block_list in level_blocks:
                 for layer in block_list:
                     if isinstance(layer, ResBlock3D):
-                        x = layer(x, time_emb)
+                        x = self._checkpoint_forward(layer, x, time_emb)
                     else:  # TemporalAttention
-                        x = layer(x)
+                        x = self._checkpoint_forward(layer, x)
 
             skip_connections.append(x)
             x = downsample(x)
 
         # Middle
-        x = self.mid_block1(x, time_emb)
-        x = self.mid_attn(x)
-        x = self.mid_block2(x, time_emb)
+        x = self._checkpoint_forward(self.mid_block1, x, time_emb)
+        x = self._checkpoint_forward(self.mid_attn, x)
+        x = self._checkpoint_forward(self.mid_block2, x, time_emb)
 
         # Decoder
         for i, (level_blocks, upsample) in enumerate(zip(self.up_blocks, self.up_samples)):
@@ -345,9 +402,9 @@ class UNet3D(nn.Module):
 
                 for layer in block_list:
                     if isinstance(layer, ResBlock3D):
-                        x = layer(x, time_emb)
+                        x = self._checkpoint_forward(layer, x, time_emb)
                     else:  # TemporalAttention
-                        x = layer(x)
+                        x = self._checkpoint_forward(layer, x)
 
             x = upsample(x)
 

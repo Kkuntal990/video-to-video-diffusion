@@ -1,0 +1,139 @@
+# VAE Training Configuration
+# Train a custom 3D VAE from scratch for CT slice interpolation
+# Target: PSNR >35 dB reconstruction quality
+
+# Model Configuration - Lightweight VAE
+model:
+  in_channels: 1  # Grayscale CT scans
+  latent_dim: 4  # Standard latent dimension
+  vae_base_channels: 64  # Base channels for encoder/decoder
+  vae_scaling_factor: 0.18215  # Standard VAE scaling
+
+  # No pretrained weights - train from scratch
+  use_pretrained: false
+  use_custom_maisi: false
+  use_maisi: false
+
+# Data Configuration - Same as main training
+data:
+  data_source: 'slice_interpolation'
+  dataset_path: '/workspace/storage_a100/dataset'
+  extract_dir: '/workspace/storage_a100/.cache/slice_interpolation_cache'
+
+  categories: ['APE', 'non-APE']
+
+  # Full-volume configuration
+  use_full_volumes: true
+  max_thick_slices: 50
+  max_thin_slices: 300
+  resolution: [512, 512]
+
+  # CT windowing
+  window_center: 40
+  window_width: 400
+
+  # Train/Val/Test split
+  val_split: 0.15
+  test_split: 0.10
+  seed: 42
+
+  # DataLoader settings
+  batch_size: 2  # Larger batch for VAE training
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+
+# VAE Training Configuration
+training:
+  num_epochs: 20  # VAEs converge quickly
+  learning_rate: 0.0001  # 1e-4
+  weight_decay: 0.01
+
+  model_suffix: 'custom_vae'
+
+  # Optimization
+  optimizer: 'adamw'
+  gradient_accumulation_steps: 4  # Effective batch = 2×4 = 8
+  max_grad_norm: 1.0
+
+  # Mixed precision
+  mixed_precision: true
+  precision: 'bf16'
+
+  # Learning rate scheduling
+  scheduler: 'cosine'
+  warmup_steps: 500
+  min_lr: 0.000001
+
+  # Checkpointing
+  checkpoint_every: 1000
+  keep_last_n_checkpoints: 3
+
+  # Validation
+  val_interval: 500
+  num_validation_samples: 10
+
+  # Logging
+  log_interval: 50
+  output_dir: '/workspace/storage_a100/outputs'
+  log_dir: '/workspace/storage_a100/logs'
+  checkpoint_dir: '/workspace/storage_a100/checkpoints'
+  experiment_name: 'vae_training'
+
+  # Weights & Biases
+  use_wandb: false
+  wandb_project: 'ct-vae-training'
+
+# VAE Loss Configuration
+losses:
+  # VAE-specific losses
+  use_vae_loss: true  # Enable VAE training mode
+
+  # Reconstruction loss (MSE)
+  lambda_recon: 1.0
+
+  # KL divergence loss (for variational)
+  lambda_kl: 0.00001  # Very small to avoid posterior collapse
+
+  # Perceptual loss (optional, helps quality)
+  use_perceptual_loss: true
+  lambda_perceptual: 0.1
+  perceptual_every_n_steps: 10
+
+  # MS-SSIM loss (helps preserve structure)
+  use_ms_ssim_loss: true
+  lambda_ssim: 0.1
+  ssim_every_n_steps: 10
+
+# Hardware Configuration
+hardware:
+  device: 'cuda'
+  num_gpus: 1
+  distributed: false
+
+  # Memory optimization
+  gradient_checkpointing: true
+  cpu_offload: false
+
+# Expected Performance (Custom VAE Training):
+#
+# 1. TRAINING SPEED:
+#    - Epoch time: ~3-5 minutes (356 patients, batch_size=2)
+#    - Total training: ~1-2 hours (20 epochs)
+#    - Much faster than diffusion training!
+#
+# 2. TARGET METRICS:
+#    - Epoch 1: PSNR ~25-28 dB (random init)
+#    - Epoch 10: PSNR ~35-38 dB (good quality)
+#    - Epoch 20: PSNR ~38-42 dB (excellent)
+#    - SSIM: 0.90-0.95
+#
+# 3. CONVERGENCE:
+#    - VAEs converge much faster than diffusion models
+#    - Should see good results by epoch 10
+#    - Can stop early if PSNR >35 dB achieved
+#
+# 4. NEXT STEPS:
+#    - Train VAE first (1-2 hours)
+#    - Validate reconstruction quality
+#    - Then freeze VAE and train diffusion model

@@ -100,6 +100,7 @@ class APECachedDataset(Dataset):
         val_split: float = 0.15,
         test_split: float = 0.10,
         seed: int = 42,
+        local_zip_dir: Optional[str] = None,
         **kwargs
     ):
         """
@@ -116,6 +117,7 @@ class APECachedDataset(Dataset):
             val_split: Fraction for validation (default 0.15 = 15%)
             test_split: Fraction for test (default 0.10 = 10%)
             seed: Random seed for reproducible splits
+            local_zip_dir: If provided, use local ZIPs instead of downloading from HF
         """
         if not PYDICOM_AVAILABLE:
             raise ImportError("pydicom required: pip install pydicom")
@@ -135,9 +137,11 @@ class APECachedDataset(Dataset):
         self.val_split = val_split
         self.test_split = test_split
         self.seed = seed
+        self.local_zip_dir = Path(local_zip_dir) if local_zip_dir else None
 
-        # Blacklist of corrupted cases (verified to have no DICOM data)
+        # Blacklist of corrupted cases (verified to have no DICOM data or missing ZIPs)
         self.corrupted_cases = {
+            'case_091', 'case_094',  # Missing ZIP files
             'case_190', 'case_191', 'case_192', 'case_193', 'case_194',
             'case_195', 'case_196', 'case_197', 'case_198', 'case_199',
             'case_200', 'case_201', 'case_202', 'case_203', 'case_204',
@@ -168,18 +172,22 @@ class APECachedDataset(Dataset):
     def _prepare_dataset(self):
         """Download, extract, and preprocess dataset (only if needed)"""
 
-        # Step 1: Get list of ZIP files from HuggingFace
-        print(f"\n[Step 1/4] Fetching file list from HuggingFace...")
-        all_files = list(list_repo_files(self.dataset_name, repo_type="dataset"))
+        # Step 1: Get list of ZIP files (from local dir or HuggingFace)
+        if self.local_zip_dir:
+            print(f"\n[Step 1/4] Finding ZIP files in local directory: {self.local_zip_dir}")
+            zip_files = self._get_local_zip_files()
+        else:
+            print(f"\n[Step 1/4] Fetching file list from HuggingFace...")
+            all_files = list(list_repo_files(self.dataset_name, repo_type="dataset"))
 
-        # Collect files by category
-        zip_files = []
-        category_counts = {}
-        for category in self.categories:
-            category_files = [f for f in all_files if f.startswith(f"{category}/") and f.endswith(".zip")]
-            category_counts[category] = len(category_files)
-            zip_files.extend(category_files)
-            print(f"  Found {len(category_files)} cases in '{category}' category")
+            # Collect files by category
+            zip_files = []
+            category_counts = {}
+            for category in self.categories:
+                category_files = [f for f in all_files if f.startswith(f"{category}/") and f.endswith(".zip")]
+                category_counts[category] = len(category_files)
+                zip_files.extend(category_files)
+                print(f"  Found {len(category_files)} cases in '{category}' category")
 
         # Filter out corrupted cases
         valid_zip_files = []
@@ -188,7 +196,7 @@ class APECachedDataset(Dataset):
 
         for zip_file in zip_files:
             case_id = Path(zip_file).stem
-            category = zip_file.split('/')[0]
+            category = zip_file.split('/')[0] if '/' in zip_file else 'unknown'
             if case_id not in self.corrupted_cases:
                 valid_zip_files.append(zip_file)
                 if category in valid_by_category:
@@ -245,6 +253,31 @@ class APECachedDataset(Dataset):
             print(f"   See detailed report: {failure_report_path}")
         print()
 
+    def _get_local_zip_files(self) -> List[str]:
+        """Get list of ZIP files from local directory"""
+        zip_files = []
+
+        for category in self.categories:
+            # Try both "non APE" (HF format) and "non-APE" (local folder format)
+            category_variants = [category]
+            if category == "non APE":
+                category_variants.append("non-APE")
+            elif category == "non-APE":
+                category_variants.append("non APE")
+
+            for cat_variant in category_variants:
+                category_dir = self.local_zip_dir / cat_variant
+                if category_dir.exists():
+                    category_zips = list(category_dir.glob('*.zip'))
+                    # Store as category/filename.zip format (same as HF)
+                    for zip_path in category_zips:
+                        # Use original category name (not variant)
+                        zip_files.append(f"{category}/{zip_path.name}")
+                    print(f"  Found {len(category_zips)} cases in '{cat_variant}/' folder")
+                    break
+
+        return zip_files
+
     def _download_and_extract(self, zip_files: List[str]):
         """Download and extract all ZIP files"""
         import zipfile
@@ -272,19 +305,41 @@ class APECachedDataset(Dataset):
             print(f"✓ All {len(zip_files)} cases already extracted, skipping downloads")
             return
 
-        print(f"Downloading and extracting {len(to_download)} cases...")
-        for zip_file in tqdm(to_download, desc="Download & Extract"):
+        print(f"{'Extracting' if self.local_zip_dir else 'Downloading and extracting'} {len(to_download)} cases...")
+        for zip_file in tqdm(to_download, desc="Extract" if self.local_zip_dir else "Download & Extract"):
             case_id = Path(zip_file).stem
             extracted_case_dir = self.extracted_dir / case_id
 
             try:
-                # Download ZIP
-                local_zip_path = hf_hub_download(
-                    repo_id=self.dataset_name,
-                    filename=zip_file,
-                    repo_type="dataset",
-                    cache_dir=str(self.raw_dir)
-                )
+                # Get ZIP path (local or download from HF)
+                if self.local_zip_dir:
+                    # Use local ZIP file
+                    category = zip_file.split('/')[0]
+                    # Try both category name variants
+                    category_variants = [category]
+                    if category == "non APE":
+                        category_variants.append("non-APE")
+                    elif category == "non-APE":
+                        category_variants.append("non APE")
+
+                    local_zip_path = None
+                    for cat_variant in category_variants:
+                        potential_path = self.local_zip_dir / cat_variant / Path(zip_file).name
+                        if potential_path.exists():
+                            local_zip_path = potential_path
+                            break
+
+                    if not local_zip_path or not local_zip_path.exists():
+                        print(f"\n  ✗ Local ZIP not found: {zip_file}")
+                        continue
+                else:
+                    # Download from HuggingFace
+                    local_zip_path = hf_hub_download(
+                        repo_id=self.dataset_name,
+                        filename=zip_file,
+                        repo_type="dataset",
+                        cache_dir=str(self.raw_dir)
+                    )
 
                 # Extract
                 if extracted_case_dir.exists():
@@ -294,14 +349,15 @@ class APECachedDataset(Dataset):
                 with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
                     zip_ref.extractall(extracted_case_dir)
 
-                # Delete ZIP to save space
-                os.remove(local_zip_path)
+                # Delete ZIP only if downloaded from HF (not if using local ZIPs)
+                if not self.local_zip_dir:
+                    os.remove(local_zip_path)
 
             except Exception as e:
                 print(f"\n  ✗ Error with {case_id}: {e}")
                 continue
 
-        print(f"✓ Downloaded and extracted {len(to_download)} cases")
+        print(f"✓ {'Extracted' if self.local_zip_dir else 'Downloaded and extracted'} {len(to_download)} cases")
 
     def _preprocess_all_cases(self, zip_files: List[str]):
         """Preprocess all cases and save as .pt files"""
@@ -730,6 +786,7 @@ def get_ape_cached_dataloader(
     val_split: float = 0.15,
     test_split: float = 0.10,
     seed: int = 42,
+    local_zip_dir: Optional[str] = None,
     **kwargs
 ) -> DataLoader:
     """
@@ -748,6 +805,7 @@ def get_ape_cached_dataloader(
         val_split: Fraction for validation (default 0.15 = 15%)
         test_split: Fraction for test (default 0.10 = 10%)
         seed: Random seed for reproducible splits
+        local_zip_dir: If provided, use local ZIPs instead of downloading from HF
     """
 
     dataset = APECachedDataset(
@@ -761,6 +819,7 @@ def get_ape_cached_dataloader(
         val_split=val_split,
         test_split=test_split,
         seed=seed,
+        local_zip_dir=local_zip_dir,
         **kwargs
     )
 

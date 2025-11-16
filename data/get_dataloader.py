@@ -5,6 +5,7 @@ This module provides a single function that automatically chooses
 the right dataloader based on configuration:
 - Local files: Uses APEDataset (for testing with downloaded samples)
 - HuggingFace: Uses APEHuggingFaceDataset (for cloud training)
+- Slice Interpolation: Uses SliceInterpolationDataset (for CT slice interpolation with full volumes)
 
 Usage:
     from data.get_dataloader import get_dataloader
@@ -21,6 +22,17 @@ Usage:
     config = {
         'data_source': 'huggingface',
         'dataset_name': 't2ance/APE-data',
+        ...
+    }
+    dataloader = get_dataloader(config, split='train')
+
+    # For CT slice interpolation (full volumes)
+    config = {
+        'data_source': 'slice_interpolation',
+        'dataset_path': '/path/to/dataset',
+        'resolution': [512, 512],
+        'max_thick_slices': 50,
+        'max_thin_slices': 300,
         ...
     }
     dataloader = get_dataloader(config, split='train')
@@ -42,7 +54,7 @@ def get_dataloader(config: Dict[str, Any], split: str = 'train') -> DataLoader:
         DataLoader instance
 
     Configuration Keys:
-        data_source: 'local' or 'huggingface' or 'auto'
+        data_source: 'local', 'huggingface', 'slice_interpolation', or 'auto'
 
         For local:
             - data_dir: Path to local data directory
@@ -54,8 +66,14 @@ def get_dataloader(config: Dict[str, Any], split: str = 'train') -> DataLoader:
             - streaming: bool (default: True)
             - cache_dir: Optional cache directory
 
+        For slice_interpolation:
+            - dataset_path: Path to dataset with .zip files
+            - max_thick_slices: Max thick slices to keep (e.g., 50)
+            - max_thin_slices: Max thin slices to keep (e.g., 300)
+            - categories: ['APE', 'non-APE']
+
         Common:
-            - num_frames: int
+            - num_frames: int (not used for slice_interpolation)
             - resolution: [H, W]
             - batch_size: int
             - num_workers: int
@@ -106,8 +124,10 @@ def get_dataloader(config: Dict[str, Any], split: str = 'train') -> DataLoader:
         return _get_local_dataloader(config, split)
     elif data_source == 'huggingface' or data_source == 'hf':
         return _get_hf_dataloader(config, split)
+    elif data_source == 'slice_interpolation':
+        return _get_slice_interpolation_dataloader(config, split)
     else:
-        raise ValueError(f"Unknown data_source: {data_source}. Must be 'local' or 'huggingface'")
+        raise ValueError(f"Unknown data_source: {data_source}. Must be 'local', 'huggingface', or 'slice_interpolation'")
 
 
 def _get_local_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
@@ -152,7 +172,8 @@ def _get_hf_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
             split=split,
             val_split=config.get('val_split', 0.15),
             test_split=config.get('test_split', 0.10),
-            seed=config.get('seed', 42)
+            seed=config.get('seed', 42),
+            local_zip_dir=config.get('local_zip_dir')
         )
 
     # Use streaming mode (old behavior)
@@ -176,6 +197,33 @@ def _get_hf_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
             cache_dir=config.get('cache_dir'),
             max_samples=config.get('max_samples')
         )
+
+
+def _get_slice_interpolation_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
+    """
+    Get dataloader for CT slice interpolation with full volumes
+
+    This loader handles the specific task of slice interpolation:
+    - Input: Thick slices (~50 @ 5.0mm) from patient/1/
+    - Output: Thin slices (~300 @ 1.0mm) from patient/2/
+    - NO downsampling - full volumes preserved
+    - Variable depth handling
+    """
+    from .slice_interpolation_dataset import get_slice_interpolation_dataloader
+
+    dataset_path = config.get('dataset_path')
+    if not dataset_path:
+        raise ValueError("dataset_path is required for slice_interpolation data source")
+
+    print(f"Loading CT Slice Interpolation data from: {dataset_path}")
+    print(f"Task: Thick slices (50 @ 5.0mm) → Thin slices (300 @ 1.0mm)")
+    print(f"Mode: Full volumes (NO patches, NO downsampling)")
+
+    return get_slice_interpolation_dataloader(
+        data_dir=dataset_path,
+        config=config,
+        split=split
+    )
 
 
 def create_training_config(
