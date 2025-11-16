@@ -151,11 +151,17 @@ class AutoencoderLoss(nn.Module):
             self.lambda_ssim * ssim_loss_val
         )
 
+        # Helper to extract scalar value (handles both tensors and floats)
+        def to_scalar(val):
+            if isinstance(val, torch.Tensor):
+                return val.item()
+            return float(val)
+
         loss_dict = {
             'loss': total_loss.item(),
             'recon_loss': recon_loss.item(),
-            'perceptual_loss': perceptual_loss_val.item(),
-            'ssim_loss': ssim_loss_val.item(),
+            'perceptual_loss': to_scalar(perceptual_loss_val),
+            'ssim_loss': to_scalar(ssim_loss_val),
         }
 
         return total_loss, loss_dict
