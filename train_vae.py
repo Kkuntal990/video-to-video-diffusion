@@ -243,6 +243,7 @@ class VAETrainer:
 
         epoch_losses = []
         epoch_psnr = []
+        epoch_ssim = []
 
         grad_accum_steps = self.config['training'].get('gradient_accumulation_steps', 1)
         log_interval = self.config['training'].get('log_interval', 50)
@@ -308,13 +309,18 @@ class VAETrainer:
 
             # Compute metrics
             with torch.no_grad():
-                # Convert to [0, 1] for PSNR
+                # Convert to [0, 1] for PSNR and SSIM
                 recon_norm = (recon + 1.0) / 2.0
                 target_norm = (thick_slices + 1.0) / 2.0
 
                 psnr = calculate_psnr(recon_norm, target_norm, max_val=1.0)
+                ssim = calculate_ssim(recon_norm, target_norm, max_val=1.0)
+
                 psnr_scalar = to_scalar(psnr)
+                ssim_scalar = to_scalar(ssim)
+
                 epoch_psnr.append(psnr_scalar)
+                epoch_ssim.append(ssim_scalar)
 
             epoch_losses.append(loss_dict['loss'])
 
@@ -323,6 +329,7 @@ class VAETrainer:
                 'loss': f"{loss_dict['loss']:.4f}",
                 'recon': f"{loss_dict['recon_loss']:.4f}",
                 'psnr': f"{psnr_scalar:.2f}",
+                'ssim': f"{ssim_scalar:.4f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
             })
 
@@ -332,20 +339,23 @@ class VAETrainer:
                     f"Step {self.global_step} | "
                     f"Loss: {loss_dict['loss']:.4f} | "
                     f"Recon: {loss_dict['recon_loss']:.4f} | "
-                    f"PSNR: {psnr_scalar:.2f} dB"
+                    f"PSNR: {psnr_scalar:.2f} dB | "
+                    f"SSIM: {ssim_scalar:.4f}"
                 )
 
         # Epoch summary
         avg_loss = sum(epoch_losses) / len(epoch_losses)
         avg_psnr = sum(epoch_psnr) / len(epoch_psnr)
+        avg_ssim = sum(epoch_ssim) / len(epoch_ssim)
 
         logger.info(
             f"Epoch {epoch} Summary | "
             f"Avg Loss: {avg_loss:.4f} | "
-            f"Avg PSNR: {avg_psnr:.2f} dB"
+            f"Avg PSNR: {avg_psnr:.2f} dB | "
+            f"Avg SSIM: {avg_ssim:.4f}"
         )
 
-        return avg_loss, avg_psnr
+        return avg_loss, avg_psnr, avg_ssim
 
     @torch.no_grad()
     def validate(self, val_loader, epoch):
@@ -360,7 +370,8 @@ class VAETrainer:
 
         logger.info(f"Validating on {num_samples} samples...")
 
-        for batch_idx, batch in enumerate(val_loader):
+        pbar = tqdm(enumerate(val_loader), total=num_samples, desc="Validation")
+        for batch_idx, batch in pbar:
             if batch_idx >= num_samples:
                 break
 
@@ -385,8 +396,18 @@ class VAETrainer:
             psnr = calculate_psnr(recon_norm, target_norm, max_val=1.0)
             ssim = calculate_ssim(recon_norm, target_norm, max_val=1.0)
 
-            val_psnr.append(to_scalar(psnr))
-            val_ssim.append(to_scalar(ssim))
+            psnr_scalar = to_scalar(psnr)
+            ssim_scalar = to_scalar(ssim)
+
+            val_psnr.append(psnr_scalar)
+            val_ssim.append(ssim_scalar)
+
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss_dict['loss']:.4f}",
+                'psnr': f"{psnr_scalar:.2f}",
+                'ssim': f"{ssim_scalar:.4f}"
+            })
 
         # Compute averages
         avg_loss = sum(val_losses) / len(val_losses)
@@ -452,23 +473,27 @@ class VAETrainer:
             self.current_epoch = epoch
 
             # Train
-            train_loss, train_psnr = self.train_epoch(train_loader, epoch)
+            train_loss, train_psnr, train_ssim = self.train_epoch(train_loader, epoch)
 
             # Validate
             if epoch % val_interval == 0:
+                logger.info(f"Running validation for epoch {epoch}...")
                 val_loss, val_psnr, val_ssim = self.validate(val_loader, epoch)
 
                 # Save checkpoint
                 is_best = val_psnr > best_psnr
                 if is_best:
                     best_psnr = val_psnr
+                    logger.info(f"✓ New best PSNR: {val_psnr:.2f} dB (was {best_psnr:.2f} dB)")
 
                 self.save_checkpoint(epoch, val_psnr, is_best=is_best)
 
                 # Check if target reached
                 if val_psnr >= 35.0:
-                    logger.info(f"🎉 Target PSNR >35 dB reached! (PSNR: {val_psnr:.2f} dB)")
+                    logger.info(f"🎉 Target PSNR >35 dB reached! (PSNR: {val_psnr:.2f} dB, SSIM: {val_ssim:.4f})")
                     logger.info("VAE training successful. You can stop early if desired.")
+            else:
+                logger.info(f"Skipping validation for epoch {epoch} (runs every {val_interval} epochs)")
 
         logger.info(f"Training complete! Best PSNR: {best_psnr:.2f} dB")
         logger.info(f"Best checkpoint saved at: {self.checkpoint_dir / 'vae_best.pt'}")

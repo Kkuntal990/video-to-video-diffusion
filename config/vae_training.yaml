@@ -38,7 +38,7 @@ data:
   seed: 42
 
   # DataLoader settings
-  batch_size: 2  # Larger batch for VAE training
+  batch_size: 1  # Larger batch for VAE training
   num_workers: 0
   pin_memory: true
   drop_last: true
@@ -70,8 +70,8 @@ training:
   keep_last_n_checkpoints: 3
 
   # Validation
-  val_interval: 500
-  num_validation_samples: 10
+  val_interval: 1  # Run validation every epoch (was 500 - caused validation to never run!)
+  num_validation_samples: 20  # Increased from 10 for better validation statistics
 
   # Logging
   log_interval: 50
