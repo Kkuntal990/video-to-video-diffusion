@@ -1,7 +1,7 @@
 # Claude Context: CT Slice Interpolation Project
 
-**Last Updated**: 2025-01-13
-**Model**: Latent Diffusion + MAISI VAE for Medical Imaging
+**Last Updated**: 2025-01-15
+**Model**: Latent Diffusion for Medical CT Slice Interpolation
 **Task**: Anisotropic super-resolution (50 thick slices @ 5.0mm → 300 thin slices @ 1.0mm)
 
 ---
@@ -10,32 +10,48 @@
 
 ### Task Description
 - **Domain**: Medical imaging (CT scans for APE detection)
+- **Task**: **CT Slice Interpolation** (NOT video-to-video diffusion)
 - **Input**: Thick CT slices (50 @ 5.0mm spacing)
 - **Output**: Thin CT slices (300 @ 1.0mm spacing)
 - **Goal**: 6× depth interpolation for improved diagnostic quality
+- **Method**: Latent diffusion in compressed latent space
 
 ### Dataset
 - **Name**: APE (Acute Pulmonary Embolism) Dataset
-- **Total patients**: 356 (after preprocessing)
-- **Split**: 75% train (267), 15% val (53), 10% test (36)
+- **Total patients**: 323 (successfully preprocessed)
+- **Split**: Train=243, Val=48, Test=32
 - **Categories**: APE, non-APE
 - **Format**: DICOM ZIP files → Preprocessed .pt cache
+- **Cache location**: `/workspace/storage_a100/.cache/processed/`
 
 ---
+
+## Environment
+- **Python**: python3 using conda environment `ct-superres-mps`
+- **GPU**: V100 16GB (training), A100 80GB (inference)
+- **Docker**: `ghcr.io/kkuntal990/v2v-diffusion:latest`
+- **Storage**: `/workspace/storage_a100/`
 
 ## 🏗️ Architecture
 
 ### Model Components
 
-#### 1. VAE (Frozen, Pretrained)
-- **Type**: Custom MAISI VAE (NVIDIA Medical Imaging)
-- **Parameters**: 130M (100% pretrained weights loaded)
+#### 1. VAE (Training from Scratch - NEW)
+- **Status**: 🔄 **TRAINING IN PROGRESS** (abandoned pretrained MAISI)
+- **Type**: Custom VideoVAE (deterministic autoencoder)
+- **Parameters**: 43M (training from scratch)
+- **Architecture**:
+  - Encoder: 3-level downsampling (64→128→256 channels)
+  - Decoder: 3-level upsampling (256→128→64 channels)
+  - Latent channels: 4
+  - Base channels: 64
 - **Compression**:
-  - Spatial: 512×512 → 128×128 (4× downsampling)
-  - Depth: D → D/4 (4× downsampling)
+  - Spatial: 512×512 → 64×64 (8× downsampling)
+  - Depth: D → D (NO temporal compression)
   - Channels: 1 (grayscale) → 4 (latent)
 - **Scaling factor**: 0.18215
-- **Status**: Frozen from epoch 0
+- **Training**: 20 epochs, target PSNR >35 dB
+- **Loss**: MSE + Perceptual (LPIPS) + MS-SSIM
 
 #### 2. U-Net (Trainable)
 - **Type**: 3D U-Net for noise prediction
@@ -55,14 +71,14 @@
 - **Inference sampler**: DDIM (20-50 steps)
 - **Loss**: Masked MSE with SNR weighting
 
-### Total Model
-- **Total parameters**: 729M
-- **Trainable**: 599M (U-Net only)
-- **Frozen**: 130M (MAISI VAE)
+### Total Model (After VAE Training)
+- **Total parameters**: 642M
+- **Trainable**: 599M (U-Net only, during diffusion training)
+- **Frozen**: 43M (Custom VAE, after pretraining)
 
 ---
 
-## 🔄 Data Pipeline
+## 🔄 Data Pipeline (CT Slice Interpolation)
 
 ### Step 1: DICOM Loading (Preprocessing Phase)
 ```python
@@ -117,26 +133,28 @@ batch = {
 
 ---
 
-## 🚂 Training Pipeline
+## 🚂 Training Pipeline (Diffusion Model - After VAE Training)
 
 ### Forward Pass (Training)
 
-#### 1. VAE Encoding
+#### 1. VAE Encoding (NEW: Custom VAE Architecture)
 ```python
 # Encode input (thick slices)
 v_in: (B, 1, 50, 512, 512) range [-1, 1]
-z_in: (B, 4, 12, 128, 128) range ≈[-3, +3]
+z_in: (B, 4, 50, 64, 64) range ≈[-3, +3]  # 8× spatial, NO depth compression
 
 # Encode target (thin slices)
 v_gt: (B, 1, 300, 512, 512) range [-1, 1]
-z_gt: (B, 4, 75, 128, 128) range ≈[-3, +3]
+z_gt: (B, 4, 300, 64, 64) range ≈[-3, +3]  # 8× spatial, NO depth compression
 ```
+
+**Key Change**: Custom VAE has NO depth compression (D → D), only 8× spatial compression
 
 #### 2. Conditioning Upsampling
 ```python
 # Upsample z_in to match z_gt depth
-z_in_upsampled = F.interpolate(z_in, size=(75, 128, 128), mode='trilinear')
-# z_in_upsampled: (B, 4, 75, 128, 128)
+z_in_upsampled = F.interpolate(z_in, size=(300, 64, 64), mode='trilinear')
+# z_in_upsampled: (B, 4, 300, 64, 64)
 ```
 
 #### 3. Mask Downsampling
@@ -233,61 +251,58 @@ for t_idx in timesteps:
     z_t = sqrt(alpha_t_prev) * z_0_pred + sqrt(1-alpha_t_prev) * noise_pred
 ```
 
-#### 5. VAE Decode
+#### 5. VAE Decode (NEW: Custom VAE)
 ```python
-z_0: (1, 4, 75, 128, 128)
+z_0: (1, 4, 300, 64, 64)
 v_out: (1, 1, 300, 512, 512) range [-1, 1]
 ```
 
 ---
 
-## ⚠️ Current Issues
+## 📊 Current Status (2025-01-15)
 
-### Issue 1: NaN Values in Validation Predictions
+### ✅ Completed
+1. ✓ **MAISI VAE Investigation** - Abandoned pretrained MAISI (incompatible checkpoint)
+2. ✓ **Custom VAE Architecture** - Designed 43M parameter autoencoder
+3. ✓ **VAE Training Setup** - Created `train_vae.py` with MSE+Perceptual+SSIM losses
+4. ✓ **Model Integrity Tests** - Comprehensive test suite (3 test files, 50+ tests)
+5. ✓ **Code Structure Validation** - All tests passed locally
+6. ✓ **Input Shape Bug Fixed** - Dataset returns `(B, C, D, H, W)` correctly
 
-**Status**: CRITICAL - Under Investigation
-**Symptoms**:
-- All validation samples contain NaN values (60-80M pixels)
-- PSNR = 0.00 dB, SSIM = 0.0000 (due to NaN detection)
-- Training loss is stable (~0.02-0.07)
+### 🔄 In Progress
+1. **Custom VAE Training** - Training from scratch on V100 GPU
+   - Target: PSNR >35 dB reconstruction quality
+   - Duration: 1-2 hours (20 epochs)
+   - Status: Job deployed, waiting for completion
 
-**Root Cause Identified**:
-```python
-# In DDIM sampler at high timesteps (t≈999):
-sqrt_alpha_t = 0.070  # Very small value!
-z_0_pred = (z_t - sqrt_one_minus_alpha_t * noise_pred) / 0.070
-# Division by near-zero with FP16 → overflow → NaN
-```
+### 📝 Pending
+1. **VAE Validation** - Test trained VAE reconstruction quality
+2. **Diffusion Training** - Train U-Net with frozen custom VAE
+3. **End-to-End Evaluation** - Test full slice interpolation pipeline
 
-**Contributing Factors**:
-1. **Numerical instability**: Division by small alpha values (~0.01-0.07)
-2. **Mixed precision (BF16)**: Limited dynamic range near zero
-3. **No NaN detection**: NaN propagates through all 20 sampling steps
+---
 
-**Planned Fixes** (Not Yet Implemented):
-1. Add epsilon to denominator: `z_0_pred = ... / (sqrt_alpha_t + 1e-8)`
-2. Add NaN detection after each sampling step
-3. Clamp intermediate values to prevent overflow
-4. Consider wrapping sampling in `autocast(enabled=False)` for FP32
+## ⚠️ Known Issues (Historical - RESOLVED by Custom VAE)
 
-### Issue 2: Only 24 Slices in Visualization
+### Issue 1: MAISI VAE Incompatibility (RESOLVED)
 
-**Status**: UNDER INVESTIGATION
-**Expected**: 300 thin slices in output
-**Actual**: User reports seeing only 24 slices
+**Status**: ✅ **RESOLVED** - Switched to custom VAE training
+**Root Cause**: Pretrained MAISI checkpoint produced wrong output range
+- Expected: [0, 1] normalized output
+- Actual: [-0.64, 1.84] (corrupted/incompatible weights)
+- PSNR: 7-13 dB (far below >35 dB target)
 
-**Preprocessed Cache Verified**:
-- Input (thick): (1, 50, 512, 512) ✓ Correct
-- Target (thin): (1, 300, 512, 512) ✓ Correct
-- Cache files are correct!
+**Resolution**: Train custom VideoVAE from scratch (43M params)
 
-**Possible Causes**:
-1. VAE decode chunk_size limiting output
-2. Latent shape calculation error (300/12.5 = 24)
-3. Visualization script issue
-4. Different downsampling factor than expected
+### Issue 2: Input Shape Mismatch (RESOLVED)
 
-**Need from User**: Clarification on where exactly "24 slices" is seen
+**Status**: ✅ **RESOLVED** - Fixed in commit `58d2266`
+**Root Cause**: Extra `unsqueeze(1)` added channel dimension twice
+- Dataset output: `(B, C, D, H, W)` - already has channel dim
+- Bug: Added extra unsqueeze → `(B, C, C, D, H, W)` (6D tensor)
+- Error: VAE expected 5D input
+
+**Resolution**: Removed extra `unsqueeze(1)` in `train_vae.py`
 
 ---
 
@@ -322,117 +337,167 @@ z_0_pred = (z_t - sqrt_one_minus_alpha_t * noise_pred) / 0.070
 
 ## 🎯 Training Status
 
-### Current State (Epoch 48)
-- **Training loss**: 0.0234-0.0728 (stable)
-- **Validation PSNR**: 0.00 dB (due to NaN)
-- **Validation SSIM**: 0.0000 (due to NaN)
-- **Checkpoint**: `/workspace/storage_a100/checkpoints/slice_interp_full_medium/`
+### Phase 1: VAE Training (Current)
 
-### Training Configuration
+**Status**: 🔄 In Progress
+**Location**: `/workspace/storage_a100/checkpoints/vae_training/`
+
 ```yaml
-# Optimization
-batch_size: 1 (effective: 2×8 = 16 with gradient accumulation)
-learning_rate: 0.0001
-optimizer: AdamW
-weight_decay: 0.01
-max_grad_norm: 1.0
+# VAE Training Configuration
+model:
+  architecture: VideoVAE (3-level encoder/decoder)
+  parameters: 43M
+  in_channels: 1 (grayscale CT)
+  latent_dim: 4
+  base_channels: 64
+  spatial_compression: 8× (512→64)
+  depth_compression: 1× (D→D, no temporal compression)
 
-# Mixed precision
-precision: bf16  # BF16 on A100
-gradient_checkpointing: true
+training:
+  num_epochs: 20
+  batch_size: 2
+  gradient_accumulation: 4 (effective batch = 8)
+  learning_rate: 0.0001
+  optimizer: AdamW
+  weight_decay: 0.01
+  scheduler: cosine
+  mixed_precision: bf16
 
-# Scheduling
-scheduler: cosine
-warmup_steps: 1000
-min_lr: 0.000001
+losses:
+  reconstruction: MSE (λ=1.0)
+  perceptual: LPIPS VGG (λ=0.1)
+  ssim: MS-SSIM (λ=0.1)
 
-# Validation
-val_interval: 1000 steps
-num_validation_samples: 20
+gpu: V100 16GB
+training_time: ~1-2 hours
 ```
 
-### Expected Final Performance
-- **PSNR**: 42-46 dB (after NaN fix)
-- **SSIM**: 0.92-0.97
-- **Training time**: 8-10 hours (100 epochs)
+**Expected Performance**:
+- Epoch 1: PSNR ~25-28 dB
+- Epoch 10: PSNR ~35-38 dB (target reached)
+- Epoch 20: PSNR ~38-42 dB (final)
+
+### Phase 2: Diffusion Training (Pending)
+
+**Status**: ⏳ Waiting for VAE training completion
+
+```yaml
+# Diffusion Training Configuration (After VAE)
+model:
+  vae: Custom VideoVAE (frozen, 43M)
+  unet: 3D U-Net (trainable, 599M)
+  diffusion: Cosine schedule, 1000 timesteps
+
+training:
+  num_epochs: 100
+  batch_size: 1
+  gradient_accumulation: 8 (effective batch = 8)
+  learning_rate: 0.0001
+  optimizer: AdamW
+  mixed_precision: bf16
+
+gpu: A100 80GB
+checkpoint: /workspace/storage_a100/checkpoints/slice_interp_full_medium/
+training_time: ~8-10 hours
+```
+
+**Expected Final Performance**:
+- PSNR: 42-46 dB
+- SSIM: 0.92-0.97
 
 ---
 
 ## 📁 Key Files
 
 ### Core Model Files
-- `models/model.py` - Main VideoToVideoDiffusion class
-- `models/maisi_vae.py` - Custom MAISI VAE (100% pretrained)
-- `models/vae.py` - VAE wrapper with chunking
-- `models/unet3d.py` - 3D U-Net for denoising
-- `models/diffusion.py` - Gaussian diffusion process
+- `models/model.py` - Main slice interpolation diffusion model
+- `models/vae.py` - Custom VideoVAE (8× spatial compression, no temporal)
+- `models/unet3d.py` - 3D U-Net for noise prediction
+- `models/diffusion.py` - Gaussian diffusion process with SNR weighting
+- `models/maisi_vae.py` - Legacy MAISI VAE (deprecated)
 
 ### Data Pipeline
-- `data/slice_interpolation_dataset.py` - CT data loader with preprocessing
-- `data/transforms.py` - Video/CT transforms
+- `data/slice_interpolation_dataset.py` - CT slice dataset with preprocessing
+- `data/transforms.py` - CT-specific transforms
 - `data/__init__.py` - Unified dataloader interface
 
-### Training & Inference
-- `training/trainer.py` - Training loop with validation
+### Training Scripts
+- `train_vae.py` - **NEW** Custom VAE training from scratch
+- `training/trainer.py` - Diffusion model training loop
+- `train.py` - Main training entry point
+
+### Inference & Validation
 - `inference/sampler.py` - DDPM/DDIM samplers
 - `scripts/visualize_samples.py` - Generate visualization grids
+- `tests/test_vae_reconstruction.py` - VAE quality validation
+
+### Testing
+- `tests/test_model_integrity.py` - Comprehensive pytest suite (45+ tests)
+- `tests/test_vae_compatibility.py` - VAE integration tests
+- `tests/test_code_structure.py` - Code structure validation
+- `tests/test_vae_shapes.py` - Simple shape validation
 
 ### Utilities
 - `utils/metrics.py` - PSNR/SSIM with NaN handling
 - `utils/checkpoint.py` - Checkpoint saving/loading
 
 ### Configuration
-- `config/slice_interpolation_full_medium.yaml` - Main training config
+- `config/vae_training.yaml` - **NEW** VAE training config
+- `config/slice_interpolation_full_medium.yaml` - Diffusion training config
 
 ### Kubernetes
-- `kub_files/train-job-a100.yaml` - Training job
+- `kub_files/vae-training-job-a100.yaml` - **NEW** VAE training job (V100)
+- `kub_files/train-job-a100.yaml` - Diffusion training job (A100)
+- `kub_files/vae-test-job.yaml` - VAE validation job
 - `kub_files/visualization-job-a100.yaml` - Visualization job
 - `kub_files/preprocessing-job-256.yaml` - Data preprocessing job
 
 ---
 
-## 🔍 Value Ranges Reference
+## 🔍 Value Ranges Reference (Custom VAE Architecture)
 
 | Stage | Tensor | Shape | Range | Notes |
 |-------|--------|-------|-------|-------|
 | **Raw DICOM** | HU values | (D, 512, 512) | [-1024, +3071] | Hounsfield Units |
 | **Windowed** | CT display | (D, 512, 512) | [0.0, 1.0] | After soft tissue windowing |
 | **Normalized** | Model input | (1, D, 512, 512) | [-1.0, +1.0] | Standard for diffusion |
-| **VAE Latent** | Compressed | (4, D/4, 128, 128) | ≈[-3, +3] | VAE latent space |
-| **Noisy Latent** | z_t | (4, D/4, 128, 128) | ≈[-5, +5] | With added noise |
+| **VAE Latent** | Compressed | (4, D, 64, 64) | ≈[-3, +3] | **NEW**: 8× spatial, NO depth compression |
+| **Noisy Latent** | z_t | (4, D, 64, 64) | ≈[-5, +5] | With added noise |
 | **Decoded** | Output | (1, D, 512, 512) | [-1.0, +1.0] | After VAE decode |
+
+**Key Change**: Custom VAE maintains depth dimension (D → D), only compresses spatially (512 → 64)
 
 ---
 
 ## 🚀 Next Steps
 
-### Immediate (Fix NaN Issue)
-1. **Add numerical stability to DDIM sampler**:
-   - Add epsilon to denominator
-   - Clamp intermediate values
-   - Add NaN detection per step
+### Immediate (VAE Training)
+1. **Monitor VAE training progress** 🔄
+   - Watch for PSNR >35 dB milestone (epoch ~10)
+   - Check for NaN/Inf in outputs
+   - Validate reconstruction quality
 
-2. **Test fixes**:
-   - Run visualization with fixed sampler
-   - Verify no NaN in outputs
-   - Measure actual PSNR/SSIM
+2. **VAE validation**:
+   - Run `test_vae_reconstruction.py` on trained VAE
+   - Verify PSNR >35 dB, SSIM >0.95
+   - Test on multiple patients
 
-3. **Investigate "24 slices" issue**:
-   - Get exact location where 24 is seen
-   - Check VAE decode output shape
-   - Verify target_depth propagation
+3. **Integrate trained VAE**:
+   - Update `slice_interpolation_full_medium.yaml`
+   - Point to best VAE checkpoint
+   - Freeze VAE weights for diffusion training
 
-### Short-term (Improve Quality)
-1. Resume training with fixed sampler
-2. Monitor validation metrics (should be 30-40 dB)
-3. Add perceptual loss if needed
-4. Tune inference steps (20 vs 50)
+### Short-term (Diffusion Training)
+1. Train diffusion model with frozen custom VAE
+2. Monitor validation metrics (target: 42-46 dB)
+3. Test slice interpolation quality (50 → 300 slices)
+4. Tune DDIM inference steps (20 vs 50)
 
 ### Long-term (Production)
 1. Final model selection (best checkpoint)
-2. Test set evaluation
+2. Test set evaluation on 32 held-out patients
 3. Clinical validation with radiologists
-4. Deployment pipeline
+4. Deployment pipeline for inference
 
 ---
 
