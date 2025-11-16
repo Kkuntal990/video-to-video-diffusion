@@ -26,7 +26,7 @@ import yaml
 # Add project root to path
 sys.path.append(str(Path(__file__).parent))
 
-from data.slice_interpolation_dataset import SliceInterpolationDataset
+from data.slice_interpolation_dataset import SliceInterpolationDataset, collate_variable_depth
 from models.vae import VideoVAE
 from utils.metrics import calculate_psnr, calculate_ssim
 
@@ -521,7 +521,7 @@ def main():
     logger.info(f"Train samples: {len(train_dataset)}")
     logger.info(f"Val samples: {len(val_dataset)}")
 
-    # Create dataloaders
+    # Create dataloaders with custom collate function for variable depths
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['data']['batch_size'],
@@ -529,6 +529,7 @@ def main():
         num_workers=config['data']['num_workers'],
         pin_memory=config['data']['pin_memory'],
         drop_last=config['data']['drop_last'],
+        collate_fn=collate_variable_depth,  # Handle variable slice depths
     )
 
     val_loader = DataLoader(
@@ -537,6 +538,7 @@ def main():
         shuffle=False,
         num_workers=config['data']['num_workers'],
         pin_memory=config['data']['pin_memory'],
+        collate_fn=collate_variable_depth,  # Handle variable slice depths
     )
 
     # Create trainer
