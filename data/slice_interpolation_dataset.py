@@ -623,7 +623,7 @@ class SliceInterpolationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.patient_files)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int, _retry_count: int = 0) -> Dict[str, torch.Tensor]:
         """
         Load preprocessed patient data (FAST - just loads cached .pt file)
 
@@ -636,6 +636,11 @@ class SliceInterpolationDataset(Dataset):
                 'num_thick_slices': actual number of thick slices
                 'num_thin_slices': actual number of thin slices
         """
+        # Prevent infinite recursion if many files are corrupted
+        if _retry_count > 10:
+            logger.warning(f"Too many corrupted files encountered, returning dummy sample")
+            return self._get_dummy_sample(self.patient_files[idx])
+
         patient_info = self.patient_files[idx]
         processed_file = self.processed_dir / f"{patient_info['patient_id']}.pt"
 
@@ -652,8 +657,18 @@ class SliceInterpolationDataset(Dataset):
             return sample_dict
         except Exception as e:
             logger.error(f"Error loading {processed_file}: {e}")
-            # Return next sample on error
-            return self.__getitem__((idx + 1) % len(self.patient_files))
+            logger.warning(f"Skipping corrupted file and trying next sample (retry {_retry_count + 1}/10)")
+
+            # Try to delete corrupted file to free up space and prevent future issues
+            try:
+                processed_file.unlink()
+                logger.info(f"Deleted corrupted file: {processed_file}")
+            except Exception as del_err:
+                logger.warning(f"Could not delete corrupted file: {del_err}")
+
+            # Return next sample on error with retry counter
+            next_idx = (idx + 1) % len(self.patient_files)
+            return self.__getitem__(next_idx, _retry_count=_retry_count + 1)
 
     def _get_dummy_sample(self, patient_info: Dict) -> Dict[str, torch.Tensor]:
         """Create dummy sample for error cases"""
