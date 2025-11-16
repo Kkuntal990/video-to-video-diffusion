@@ -100,38 +100,13 @@ spec:
           ls "$PROCESSED_DIR/" | sort | tail -10
           echo ""
 
-          # Check for missing ranges
-          echo "Checking for missing case ranges..."
-          python3 << 'EOF'
-import os
-from pathlib import Path
-
-processed_dir = Path("/workspace/storage_a100/.cache/processed")
-if processed_dir.exists():
-    files = sorted(processed_dir.glob("case_*.pt"))
-    case_numbers = [int(f.stem.split('_')[1]) for f in files]
-
-    if case_numbers:
-        print(f"Case range: {min(case_numbers)} to {max(case_numbers)}")
-        print(f"Total cases: {len(case_numbers)}")
-
-        # Check for gaps
-        missing = []
-        for i in range(min(case_numbers), max(case_numbers) + 1):
-            if i not in case_numbers:
-                missing.append(i)
-
-        if missing:
-            print(f"\nMissing case numbers: {missing[:50]}")  # Show first 50
-            if len(missing) > 50:
-                print(f"... and {len(missing) - 50} more")
-        else:
-            print("\n✓ No gaps in case numbering")
-    else:
-        print("No case files found!")
-else:
-    print("Processed directory doesn't exist!")
-EOF
+          # Check for case number range (simplified - no Python)
+          echo "Checking case number range..."
+          FIRST_CASE=$(ls "$PROCESSED_DIR/" 2>/dev/null | sort | head -1 | sed 's/case_//;s/.pt//')
+          LAST_CASE=$(ls "$PROCESSED_DIR/" 2>/dev/null | sort | tail -1 | sed 's/case_//;s/.pt//')
+          if [ -n "$FIRST_CASE" ]; then
+            echo "Case range: $FIRST_CASE to $LAST_CASE"
+          fi
 
           echo ""
 
