@@ -22,6 +22,5 @@ omegaconf>=2.3.0
 pydicom>=2.4.0
 matplotlib>=3.7.0
 pytorch-msssim>=1.0.0
-medvae>=0.1.0
+git+https://github.com/StanfordMIMI/MedVAE.git
 monai[all]>=1.4.0
-huggingface-hub>=0.20.0
