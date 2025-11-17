@@ -8,7 +8,7 @@ scipy>=1.11.0
 tqdm>=4.65.0
 pyyaml>=6.0
 tensorboard>=2.13.0
-wandb>=0.15.0
+wandb==0.14.0
 datasets>=2.14.0
 huggingface-hub>=0.16.0
 av>=10.0.0
