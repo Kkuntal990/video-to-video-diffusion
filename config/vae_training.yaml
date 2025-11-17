@@ -24,8 +24,8 @@ data:
 
   # Full-volume configuration
   use_full_volumes: true
-  max_thick_slices: 40  # Reduced from 50 for memory (20% reduction)
-  max_thin_slices: 240  # Reduced from 300 for memory (20% reduction)
+  max_thick_slices: 50  # Full thick volume depth
+  max_thin_slices: 300  # Full thin volume depth
   resolution: [512, 512]
 
   # CT windowing

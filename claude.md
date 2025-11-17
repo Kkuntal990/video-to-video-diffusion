@@ -1,6 +1,6 @@
 # Claude Context: CT Slice Interpolation Project
 
-**Last Updated**: 2025-01-15
+**Last Updated**: 2025-01-16
 **Model**: Latent Diffusion for Medical CT Slice Interpolation
 **Task**: Anisotropic super-resolution (50 thick slices @ 5.0mm → 300 thin slices @ 1.0mm)
 
@@ -38,7 +38,7 @@
 #### 1. VAE (Training from Scratch - NEW)
 - **Status**: 🔄 **TRAINING IN PROGRESS** (abandoned pretrained MAISI)
 - **Type**: Custom VideoVAE (deterministic autoencoder)
-- **Parameters**: 43M (training from scratch)
+- **Parameters**: ~25M (training from scratch)
 - **Architecture**:
   - Encoder: 3-level downsampling (64→128→256 channels)
   - Decoder: 3-level upsampling (256→128→64 channels)
@@ -46,22 +46,44 @@
   - Base channels: 64
 - **Compression**:
   - Spatial: 512×512 → 64×64 (8× downsampling)
-  - Depth: D → D (NO temporal compression)
+  - Depth: D → D (NO temporal/depth compression)
   - Channels: 1 (grayscale) → 4 (latent)
 - **Scaling factor**: 0.18215
-- **Training**: 20 epochs, target PSNR >35 dB
-- **Loss**: MSE + Perceptual (LPIPS) + MS-SSIM
+- **Training**: 50 epochs, target PSNR >35 dB
+- **Loss**: MSE + MS-SSIM (Perceptual disabled for memory)
+- **Dimension Flow** (thick slices example):
+  - Input: (B, 1, 50, 512, 512) range [-1, 1]
+  - After conv_in: (B, 64, 50, 512, 512)
+  - After down1: (B, 128, 50, 256, 256)
+  - After down2: (B, 256, 50, 128, 128)
+  - After down3: (B, 256, 50, 64, 64)
+  - Latent: (B, 4, 50, 64, 64) range ≈[-3, +3]
+  - Decoder reverses this process
+  - Output: (B, 1, 50, 512, 512) range [-1, 1]
 
 #### 2. U-Net (Trainable)
 - **Type**: 3D U-Net for noise prediction
-- **Parameters**: 599M (Medium model, 128 channels)
+- **Parameters**: 270M (Medium model, 128 channels)
 - **Architecture**:
   - Model channels: 128
   - Res blocks: 2 per level
-  - Attention levels: [1, 2]
-  - Channel mult: [1, 2, 4, 4]
+  - Attention levels: [1, 2] (temporal attention)
+  - Channel mult: [1, 2, 4, 4] → [128, 256, 512, 512]
   - Num heads: 8
   - Time embed dim: 1024
+  - Gradient checkpointing: Enabled
+- **Dimension Flow** (50→300 slices):
+  - Input: Noisy latent (B, 4, 75, 64, 64) + Conditioning (B, 4, 75, 64, 64)
+  - Concatenated: (B, 8, 75, 64, 64)
+  - Encoder levels:
+    - Level 0: (B, 128, 75, 64, 64)
+    - Level 1: (B, 256, 75, 32, 32) + temporal attention
+    - Level 2: (B, 512, 75, 16, 16) + temporal attention
+    - Level 3: (B, 512, 75, 8, 8)
+  - Middle: (B, 512, 75, 8, 8) + attention
+  - Decoder: Mirrors encoder with skip connections
+  - Output: Predicted noise (B, 4, 75, 64, 64)
+- **Note**: Spatial downsampling only (depth preserved for temporal consistency)
 
 #### 3. Diffusion Process
 - **Schedule**: Cosine noise schedule
@@ -71,9 +93,9 @@
 - **Loss**: Masked MSE with SNR weighting
 
 ### Total Model (After VAE Training)
-- **Total parameters**: 642M
-- **Trainable**: 599M (U-Net only, during diffusion training)
-- **Frozen**: 43M (Custom VAE, after pretraining)
+- **Total parameters**: ~295M
+- **Trainable**: 270M (U-Net only, during diffusion training)
+- **Frozen**: ~25M (Custom VAE, after pretraining)
 
 ---
 
@@ -309,5 +331,10 @@ kubectl logs -f v2v-diffusion-visualization-job-a100-xxxxx
 - **Last checkpoint**: `checkpoint_epoch_48.pt` (2025-01-13)
 
 ---
+
+
+## Instructions
+- Do not create any documents except when explicitly asked. 
+- Do not commit and push unless explicitly stated.
 
 **End of Context Document**
