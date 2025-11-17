@@ -17,36 +17,21 @@ import sys
 import math
 import json
 from pathlib import Path
-import subprocess
 
 import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
 
-# Try importing MedVAE, install if needed
+# Import MedVAE and metrics (pre-installed in Docker)
 try:
     from medvae import MVAE
-except ImportError:
-    print("MedVAE not found, installing...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "medvae"], check=False)
-    try:
-        from medvae import MVAE
-    except ImportError:
-        print("ERROR: Failed to install MedVAE. Please install manually: pip install medvae")
-        sys.exit(1)
-
-# Try importing pytorch-msssim, install if needed
-try:
     from pytorch_msssim import ssim
-except ImportError:
-    print("pytorch-msssim not found, installing...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "pytorch-msssim"], check=False)
-    try:
-        from pytorch_msssim import ssim
-    except ImportError:
-        print("ERROR: Failed to install pytorch-msssim. Please install manually: pip install pytorch-msssim")
-        sys.exit(1)
+except ImportError as e:
+    print(f"ERROR: Required packages not installed: {e}")
+    print("Please ensure medvae and pytorch-msssim are in requirements.txt")
+    print("Rebuild Docker image with: docker build -t ghcr.io/kkuntal990/v2v-diffusion:latest .")
+    sys.exit(1)
 
 
 def load_preprocessed_sample(pt_file: Path, use_thick: bool = False):

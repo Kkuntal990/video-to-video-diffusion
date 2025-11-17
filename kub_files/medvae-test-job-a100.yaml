@@ -30,12 +30,6 @@ spec:
           echo "Node: $(hostname)"
           echo ""
 
-          # Install MedVAE and dependencies
-          echo "Installing MedVAE and dependencies..."
-          pip install --quiet medvae pytorch-msssim Pillow
-          echo "✓ Dependencies installed"
-          echo ""
-
           # Check preprocessed cache
           echo "Checking preprocessed cache..."
           CACHE_DIR="/workspace/storage_a100/.cache/processed"
@@ -89,8 +83,8 @@ spec:
             cpu: "4"
             nvidia.com/a100: "1"
           limits:
-            memory: "32Gi"
-            cpu: "8"
+            memory: "16Gi"
+            cpu: "4"
             nvidia.com/a100: "1"
 
         volumeMounts:
@@ -102,8 +96,6 @@ spec:
         env:
         - name: PYTHONUNBUFFERED
           value: "1"
-        - name: CUDA_VISIBLE_DEVICES
-          value: "0"
         - name: TORCH_HOME
           value: "/workspace/storage_a100/.cache/torch"
         - name: HF_HOME
