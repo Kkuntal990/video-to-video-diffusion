@@ -99,46 +99,202 @@
 
 ---
 
-## 🔄 Data Pipeline (CT Slice Interpolation)
+## 🔧 Preprocessing Pipeline (DICOM → Cached Tensors)
 
-### Step 1: DICOM Loading (Preprocessing Phase)
-```python
-# Raw DICOM files
-thick_volume: (50, 512, 512) HU values [-1024, +3071]
-thin_volume: (300, 512, 512) HU values [-1024, +3071]
+**Overview:** Raw DICOM CT scans are preprocessed ONCE into cached .pt files. Subsequent training loads from the fast cache (100-200× speedup).
+
+### Complete Transformation Pipeline
+
+#### **Stage 0: Raw Data Structure**
 ```
+/workspace/storage_a100/dataset/
+├── APE/
+│   ├── case_001.zip          # ZIP containing DICOM files
+│   └── ...
+└── non-APE/
+    └── ...
 
-### Step 2: CT Windowing
-```python
-# Window settings (soft tissue + vessels)
-window_center = 40 HU
-window_width = 400 HU
-# Clip to [-160, +240] HU, normalize to [0, 1]
-thick_windowed: (50, 512, 512) range [0.0, 1.0]
-thin_windowed: (300, 512, 512) range [0.0, 1.0]
+Each ZIP structure:
+case_XXX/
+├── 1/                         # THICK slices (5.0mm spacing, ~50 files)
+│   ├── IM-0001-0001.dcm
+│   └── ...
+└── 2/                         # THIN slices (1.0mm spacing, ~300 files)
+    ├── IM-0002-0001.dcm
+    └── ...
 ```
+**Format:** DICOM (Digital Imaging and Communications in Medicine)
+**Initial Range:** Hounsfield Units (HU), typically [-1024, +3071]
 
-**Why windowing?**
-- Selects relevant tissues (soft tissue + blood vessels)
-- Enhances contrast where it matters clinically
-- Full HU range would waste 95% of dynamic range on irrelevant tissues
-
-### Step 3: Final Normalization
+#### **Stage 1: ZIP Extraction**
 ```python
-# Normalize [0, 1] → [-1, 1] (standard for diffusion models)
+# Extract to temporary cache
+with zipfile.ZipFile(zip_path) as zip_ref:
+    zip_ref.extractall(cache_dir)
+```
+**Output:** `/workspace/storage_a100/.cache/slice_interpolation_cache/case_XXX/`
+**Handles:** Nested structures, corrupted ZIPs (17 blacklisted cases)
+
+#### **Stage 2: DICOM Loading**
+```python
+# Load each DICOM file
+for dcm_path in dicom_files:
+    dcm = pydicom.dcmread(dcm_path)
+    slices.append(dcm.pixel_array.astype(np.float32))  # HU values
+
+# Sort by spatial position and stack
+volume = np.stack(slices, axis=0)
+```
+**Output:** `(D, 512, 512)` numpy array
+**Range:** [-1024, +3071] HU
+**Example Values:**
+- Air: -1000 HU
+- Lung: -500 to -200 HU
+- Soft tissue: 40-80 HU
+- Blood vessels: 50-100 HU
+- Bone: +400 to +1000 HU
+
+#### **Stage 3: CT Windowing** (Clinical Enhancement)
+```python
+window_center = 40 HU      # Soft tissue
+window_width = 400 HU      # Tissue + vessels
+
+lower = window_center - (window_width / 2)  # -160 HU
+upper = window_center + (window_width / 2)  # +240 HU
+
+# Clip and normalize
+windowed = np.clip(volume, lower, upper)
+windowed = (windowed - lower) / (upper - lower)
+```
+**Output:** `(D, 512, 512)`
+**Range:** [0.0, 1.0] normalized
+**Why:** Focus on diagnostically relevant tissues (soft tissue + vessels), discard 95% irrelevant HU range
+
+#### **Stage 4: Spatial Resizing**
+```python
+# Bilinear interpolation to target resolution
+resized = torch.nn.functional.interpolate(
+    volume_tensor,
+    size=(512, 512),          # Target in-plane resolution
+    mode='bilinear',
+    align_corners=False
+)
+```
+**Output:** `(D, 512, 512)`
+**Range:** [0.0, 1.0] (preserved)
+**Note:** No depth resampling (only in-plane)
+
+#### **Stage 5: Tensor Conversion**
+```python
+# Add channel dimension
+thick_tensor = torch.from_numpy(thick_volume).unsqueeze(0).float()
+thin_tensor = torch.from_numpy(thin_volume).unsqueeze(0).float()
+```
+**Output:** `(1, D, 512, 512)` torch.float32
+**Range:** [0.0, 1.0]
+
+#### **Stage 6: Final Normalization**
+```python
+# Convert to diffusion model standard range
 thick_tensor = thick_tensor * 2.0 - 1.0
 thin_tensor = thin_tensor * 2.0 - 1.0
+```
+**Output:** `(1, D, 512, 512)`
+**Range:** [-1.0, +1.0]
+**Transformation:** 0.0→-1.0, 0.5→0.0, 1.0→+1.0
 
-# Cached to .pt files
+#### **Stage 7: Cache File Creation**
+```python
+processed_file = processed_dir / f"{case_id}.pt"
 torch.save({
-    'input': (1, 50, 512, 512),   # range [-1, 1]
-    'target': (1, 300, 512, 512),  # range [-1, 1]
-    'category': 'APE',
+    'input': thick_tensor,         # (1, 50, 512, 512) [-1, 1]
+    'target': thin_tensor,         # (1, 300, 512, 512) [-1, 1]
+    'category': 'APE',             # 'APE' or 'non-APE'
     'patient_id': 'case_XXX',
     'num_thick_slices': 50,
     'num_thin_slices': 300
-}, 'case_XXX.pt')
+}, processed_file)
 ```
+**Output Location:** `/workspace/storage_a100/.cache/processed/case_XXX.pt`
+**File Size:** ~300-500 MB per patient
+**Total Cache:** ~15-20 GB for 356 patients
+
+#### **Stage 8: Cleanup**
+```python
+# Delete extracted DICOM files to save storage
+shutil.rmtree(patient_dir)
+```
+**Storage Savings:** ~25-30 GB (extracted DICOMs deleted, cache kept)
+
+---
+
+### Value Range Summary
+
+| Stage | Shape | Range | Format | Notes |
+|-------|-------|-------|--------|-------|
+| **Raw DICOM** | `(D, H, W)` | `[-1024, +3071]` | Hounsfield Units | Clinical CT values |
+| **After Loading** | `(D, 512, 512)` | `[-1024, +3071]` | HU | Stacked slices |
+| **After Windowing** | `(D, 512, 512)` | `[0.0, 1.0]` | Normalized | Clipped to [-160, +240] HU |
+| **After Resize** | `(D, 512, 512)` | `[0.0, 1.0]` | Normalized | Bilinear interpolation |
+| **Tensor** | `(1, D, 512, 512)` | `[0.0, 1.0]` | torch.float32 | Added channel dim |
+| **Final** | `(1, D, 512, 512)` | `[-1.0, +1.0]` | torch.float32 | Diffusion standard |
+| **Cached** | `dict` | `[-1.0, +1.0]` | .pt file | Preprocessed cache |
+
+---
+
+### Example: Complete Transformation (case_111)
+
+```python
+# 1. Raw DICOM
+thick_dicom: 50 DICOM files → (50, 512, 512), range [-1024, +3071] HU
+
+# 2. CT Windowing
+thick_windowed: (50, 512, 512), range [0.0, 1.0]
+# Formula: clip(-160, +240) HU → normalize
+
+# 3. Normalize
+thick_norm: (1, 50, 512, 512), range [-1.0, +1.0]
+# Formula: x * 2.0 - 1.0
+
+# 4. Save
+torch.save({'input': thick_norm, 'target': thin_norm, ...}, 'case_111.pt')
+# File size: ~380 MB
+```
+
+---
+
+### Preprocessing Configuration
+
+**From `config/slice_interpolation_full_medium.yaml`:**
+```yaml
+data:
+  window_center: 40          # HU (soft tissue)
+  window_width: 400          # HU (soft tissue + vessels)
+  resolution: [512, 512]     # H, W (in-plane)
+  max_thick_slices: 50       # Center crop if more
+  max_thin_slices: 300       # Center crop if more
+  extract_dir: '/workspace/storage_a100/.cache/slice_interpolation_cache'
+```
+
+---
+
+### Performance Characteristics
+
+**First Run (Preprocessing):**
+- Time: 5-10 min/patient (~30-60 hours total for 356 patients)
+- Actions: Extract ZIP → Load DICOM → Window → Resize → Normalize → Cache → Cleanup
+
+**Subsequent Runs (Cache Loading):**
+- Time: 0.5 sec/patient (~3 min total)
+- Actions: Load .pt file directly
+
+**Speedup:** 100-200× faster after preprocessing!
+
+---
+
+## 🔄 Data Pipeline (Training Phase)
+
+After preprocessing, each training epoch uses the cached data:
 
 ### Step 4: Batch Collation with Padding
 ```python
