@@ -1,6 +1,6 @@
-# Video-to-Video Diffusion Model for Medical CT Enhancement
+# CT Slice Interpolation with Latent Diffusion
 
-A PyTorch implementation of a 3D video-to-video latent diffusion model for medical CT scan reconstruction and enhancement, with support for two-phase training and Kubernetes deployment.
+A PyTorch implementation of a 3D latent diffusion model for medical CT slice interpolation (anisotropic super-resolution), with support for custom VAE training and Kubernetes deployment.
 
 ## 🚀 Quick Start
 
@@ -20,34 +20,38 @@ kubectl exec -it v2v-diffusion-interactive -- python train.py --config config/cl
 
 ## 📋 Overview
 
-This implementation provides a complete pipeline for training and deploying video-to-video diffusion models for medical imaging:
+This implementation provides a complete pipeline for training and deploying CT slice interpolation models using latent diffusion:
+
+**Task:** Anisotropic super-resolution for CT scans (50 thick slices @ 5.0mm → 300 thin slices @ 1.0mm)
 
 ### Key Features
 
-- ✅ **3D Video VAE**: Compresses CT volumes into latent space (8× spatial compression)
+- ✅ **Custom Trained VAE**: 3D autoencoder with 8× spatial compression for CT volumes
 - ✅ **3D U-Net Denoiser**: Predicts noise conditioned on input CT scans
-- ✅ **Two-Phase Training**: Freeze VAE first, then fine-tune end-to-end for better convergence
+- ✅ **Patch-Based Training**: Memory-efficient training on 192×192×48 patches
 - ✅ **Layer-Wise Learning Rates**: Different LRs for VAE and U-Net components
-- ✅ **Kubernetes Support**: Production-ready deployment with GPU scheduling
-- ✅ **Persistent Storage**: Checkpoints survive pod restarts
-- ✅ **Mixed Precision**: FP16 training for 2× speedup
-- ✅ **HuggingFace Integration**: Stream APE-data dataset without downloading
+- ✅ **Kubernetes Support**: Production-ready deployment with A100 GPU scheduling
+- ✅ **Persistent Storage**: Checkpoints and cache survive pod restarts
+- ✅ **Mixed Precision**: BF16 training for better stability on A100
+- ✅ **APE Dataset**: 431 patient CT scans with pulmonary embolism annotations
 - ✅ **DDIM/DDPM Sampling**: Fast deterministic or stochastic inference
 
 ### What's New (Latest Updates)
 
-🎯 **Two-Phase Training Strategy**
-- Phase 1: Train U-Net only (VAE frozen) → faster initial convergence
-- Phase 2: Fine-tune entire model → improved final quality
-- Automatic phase transition during training
+🎯 **Custom VAE Training Complete**
+- Trained 173M parameter VAE from scratch on CT data
+- 8 latent channels, U-Net style skip connections
+- PSNR >35 dB reconstruction quality
 
-🔧 **Layer-Wise Learning Rates**
-- U-Net: 1e-4 (full learning rate)
-- VAE: 1e-5 (10× lower for stability)
+🔧 **PyTorch Best Practices**
+- Standard checkpoint loading (no model duplication)
+- Proper gradient scoping with `@torch.no_grad()`
+- Global imports (no local import issues)
 
-💾 **Persistent Checkpoint Storage**
-- Checkpoints saved to `/workspace/storage/checkpoints/`
-- Survives pod restarts and failures
+💾 **Efficient Caching Pipeline**
+- One-time DICOM preprocessing to .pt tensors
+- Cached preprocessed data (~15-20 GB)
+- 100-200× faster data loading after preprocessing
 - 20Gi PersistentVolumeClaim on Kubernetes
 
 🐳 **Kubernetes Production Deployment**

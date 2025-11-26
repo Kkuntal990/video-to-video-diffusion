@@ -64,9 +64,12 @@ def calculate_scaling_factor(
     logger.info(f"Checkpoint: {checkpoint_path}")
     logger.info(f"Samples: {num_samples}")
 
-    # Load model
+    # Load model (standard PyTorch pattern)
     logger.info("\\nLoading model from checkpoint...")
-    model, checkpoint = VideoToVideoDiffusion.load_checkpoint(checkpoint_path, device=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model = VideoToVideoDiffusion(checkpoint['config'])
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
     model.eval()
 
     logger.info(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")

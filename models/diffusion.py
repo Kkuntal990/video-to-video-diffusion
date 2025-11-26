@@ -141,9 +141,18 @@ class GaussianDiffusion(nn.Module):
         # Predict noise
         noise_pred = model(z_t, t, c)
 
+        # SNR weighting for timestep normalization (used in both masked and unmasked cases)
+        # Diffusion loss naturally varies 100× across timesteps (high noise vs low noise)
+        # Min-SNR weighting down-weights easy (low-noise) timesteps to balance variance
+        # Based on "Imagen" and "Perception Prioritized Training" papers
+        snr = self.alphas_cumprod[t] / (1 - self.alphas_cumprod[t] + 1e-8)  # (B,)
+        snr_weight = torch.clamp(snr, max=5.0) / (snr + 1e-8)  # Min-SNR-5
+
         # Compute MSE loss (base diffusion loss)
         if mask is not None:
             # Masked MSE loss: only compute loss on real (non-padded) regions
+            # Used in full-volume mode with variable-depth batches
+
             # Expand mask to match noise shape: (B, C, T) -> (B, C, T, H, W)
             mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)  # (B, C, T, 1, 1)
             mask_expanded = mask_expanded.expand_as(noise_pred)  # (B, C, T, H, W)
@@ -152,38 +161,42 @@ class GaussianDiffusion(nn.Module):
             mse_per_element = (noise_pred - noise) ** 2
             masked_mse = mse_per_element * mask_expanded
 
-            # FIXED: Per-sample normalization to prevent loss variance from varying depths
-            # Each sample normalized by ITS OWN valid elements, then averaged over batch
-            # This ensures loss magnitude is independent of depth variation
-            batch_size = noise_pred.shape[0]
-            losses_per_sample = []
+            # Check if all samples have same number of valid elements (patch-based mode)
+            num_valid_per_sample = mask_expanded.reshape(B, -1).sum(dim=1)  # (B,)
+            all_same_size = (num_valid_per_sample == num_valid_per_sample[0]).all()
 
-            # ADDITIONAL FIX: SNR weighting to normalize across timesteps
-            # Diffusion loss naturally varies 100x across timesteps (high noise vs low noise)
-            # Min-SNR weighting down-weights easy (low-noise) timesteps to balance variance
-            # Based on "Imagen" and "Perception Prioritized Training" papers
-            snr = self.alphas_cumprod[t] / (1 - self.alphas_cumprod[t] + 1e-8)  # (B,)
-            snr_weight = torch.clamp(snr, max=5.0) / (snr + 1e-8)  # Min-SNR-5: down-weight high-SNR (easy) samples
+            if all_same_size:
+                # Patch-based mode: all samples same size, use efficient batch MSE
+                num_valid_total = mask_expanded.sum()
+                loss_mse_unweighted = masked_mse.sum() / num_valid_total
+                # Apply SNR weighting (broadcast over batch)
+                loss_mse = (loss_mse_unweighted * snr_weight).mean()
+            else:
+                # Full-volume mode: variable depths, use per-sample normalization
+                # Each sample normalized by its own valid elements
+                losses_per_sample = []
+                for i in range(B):
+                    sample_mse = masked_mse[i]  # (C, T, H, W)
+                    num_valid = num_valid_per_sample[i]
 
-            for i in range(batch_size):
-                sample_mse = masked_mse[i]  # (C, T, H, W)
-                sample_mask = mask_expanded[i]  # (C, T, H, W)
-                num_valid = sample_mask.sum()
+                    if num_valid > 0:
+                        # Normalize by this sample's valid elements AND timestep difficulty
+                        sample_loss = (sample_mse.sum() / num_valid) * snr_weight[i]
+                    else:
+                        # Fallback if somehow all masked out
+                        sample_loss = torch.tensor(0.0, device=noise_pred.device)
 
-                if num_valid > 0:
-                    # Normalize by this sample's valid elements AND timestep difficulty
-                    sample_loss = (sample_mse.sum() / num_valid) * snr_weight[i]
-                else:
-                    # Fallback if somehow all masked out (shouldn't happen)
-                    sample_loss = torch.tensor(0.0, device=noise_pred.device)
+                    losses_per_sample.append(sample_loss)
 
-                losses_per_sample.append(sample_loss)
-
-            # Average across batch (FIXED denominator = batch_size)
-            loss_mse = torch.stack(losses_per_sample).mean()
+                # Average across batch
+                loss_mse = torch.stack(losses_per_sample).mean()
         else:
-            # No mask: standard MSE loss
-            loss_mse = F.mse_loss(noise_pred, noise)
+            # No mask: standard MSE loss (patch-based mode typically)
+            # Compute base MSE
+            loss_mse_unweighted = F.mse_loss(noise_pred, noise, reduction='none')
+            # Apply SNR weighting per sample and average
+            loss_mse_per_sample = loss_mse_unweighted.reshape(B, -1).mean(dim=1)  # (B,)
+            loss_mse = (loss_mse_per_sample * snr_weight).mean()
 
         # Initialize loss dict
         loss_dict = {'mse': loss_mse.item()}

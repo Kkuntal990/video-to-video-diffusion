@@ -1,70 +1,62 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vae-training-job-a100
+  name: v2v-patch-evaluation
 spec:
+  ttlSecondsAfterFinished: 3600  # Keep job for 6 hours after completion
   template:
     metadata:
       labels:
-        app: v2v-diffusion
-        type: training-job
+        app: v2v-patch-evaluation
+        type: inference-job
         gpu: a100
     spec:
       restartPolicy: Never
-
       containers:
-      - name: vae-training
-        image: ghcr.io/kkuntal990/v2v-diffusion:latest
-        imagePullPolicy: Always
-
-        command: ["/bin/bash"]
-        args:
-        - "-c"
-        - |
-          echo "=========================================="
-          echo "VAE Training on A100 80GB"
-          echo "=========================================="
-          echo "GPU Info:"
-          nvidia-smi
-          echo ""
-          echo "Node: $(hostname)"
-          echo ""
-
-          # Smart resume: check if checkpoint exists (with suffix support)
-          # Read suffix from config to construct correct checkpoint path
-          SUFFIX=$(python3 -c "import yaml; c=yaml.safe_load(open('config/vae_training.yaml')); print(c['training'].get('model_suffix', ''))")
-
-          # Construct checkpoint path with suffix
-          if [ -n "$SUFFIX" ]; then
-            CHECKPOINT_PATH="/workspace/storage_a100/checkpoints/vae_training_${SUFFIX}/vae_best.pt"
-          else
-            CHECKPOINT_PATH="/workspace/storage_a100/checkpoints/vae_training/vae_best.pt"
-          fi
-
-          if [ -f "$CHECKPOINT_PATH" ]; then
-            echo "✓ Found checkpoint: $CHECKPOINT_PATH"
-            echo "✓ Resuming training from best checkpoint..."
+      - name: patch-eval
+        image: kuntalkokate/llm_agent_v2v_train:latest
+        command:
+          - /bin/bash
+          - -c
+          - |
+            echo "Starting Patch Evaluation..."
+            echo "GPU Info:"
+            nvidia-smi
+            echo ""
+            echo "Node: $(hostname)"
             echo ""
 
-            # Resume training
-            python train_vae.py \
-              --config config/vae_training.yaml \
-              --resume "$CHECKPOINT_PATH"
+            # Find latest checkpoint automatically
+            CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/slice_interp_full_medium"
+            LATEST_CHECKPOINT=$(ls -t ${CHECKPOINT_DIR}/checkpoint_best_epoch_*_slice_interp_full3.pt 2>/dev/null | head -1)
 
-          else
-            echo "⚠ No checkpoint found at $CHECKPOINT_PATH"
-            echo "✓ Starting fresh VAE training..."
+            if [ -z "$LATEST_CHECKPOINT" ]; then
+              echo "ERROR: No checkpoint found in ${CHECKPOINT_DIR}"
+              echo "Available files:"
+              ls -lh ${CHECKPOINT_DIR}/
+              exit 1
+            fi
+
+            echo "Using checkpoint: ${LATEST_CHECKPOINT}"
             echo ""
 
-            # Start fresh training
-            python train_vae.py \
-              --config config/vae_training.yaml
-          fi
+            # Run patch evaluation
+            python scripts/evaluate_and_visualize_patches.py \
+              --checkpoint "${LATEST_CHECKPOINT}" \
+              --config config/slice_interpolation_full_medium.yaml \
+              --split val \
+              --num-samples 50 \
+              --num-inference-steps 20 \
+              --sampler ddim \
+              --output-dir /workspace/storage_a100/results/patch_evaluation \
+              --save-predictions
 
-          echo ""
-          echo "=========================================="
-          echo "VAE training completed!"
-          echo "=========================================="
+            echo ""
+            echo "Patch evaluation completed!"
+            echo "Results saved to: /workspace/storage_a100/results/patch_evaluation"
+            echo ""
+            echo "Summary:"
+            cat /workspace/storage_a100/results/patch_evaluation/metrics/patch_metrics.json | grep -A 10 '"overall"'
 
         resources:
           requests:

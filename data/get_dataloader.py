@@ -201,29 +201,61 @@ def _get_hf_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
 
 def _get_slice_interpolation_dataloader(config: Dict[str, Any], split: str) -> DataLoader:
     """
-    Get dataloader for CT slice interpolation with full volumes
+    Get dataloader for CT slice interpolation
 
-    This loader handles the specific task of slice interpolation:
-    - Input: Thick slices (~50 @ 5.0mm) from patient/1/
-    - Output: Thin slices (~300 @ 1.0mm) from patient/2/
-    - NO downsampling - full volumes preserved
-    - Variable depth handling
+    Supports two modes:
+    1. Full-volume mode (use_patches=False):
+       - Input: Full thick slices (~50 @ 5.0mm)
+       - Output: Full thin slices (~300 @ 1.0mm)
+       - Variable depth handling with padding
+
+    2. Patch-based mode (use_patches=True):
+       - Input: 3D patches (8 thick slices)
+       - Output: 3D patches (48 thin slices)
+       - Fixed size, no padding, larger batch sizes
     """
-    from .slice_interpolation_dataset import get_slice_interpolation_dataloader
+    use_patches = config.get('use_patches', False)
 
-    dataset_path = config.get('dataset_path')
-    if not dataset_path:
-        raise ValueError("dataset_path is required for slice_interpolation data source")
+    if use_patches:
+        # Patch-based mode
+        from .patch_slice_interpolation_dataset import get_patch_dataloader
 
-    print(f"Loading CT Slice Interpolation data from: {dataset_path}")
-    print(f"Task: Thick slices (50 @ 5.0mm) → Thin slices (300 @ 1.0mm)")
-    print(f"Mode: Full volumes (NO patches, NO downsampling)")
+        # Use processed_dir (cache directory with .pt files) for patches
+        processed_dir = config.get('processed_dir', config.get('extract_dir'))
+        if not processed_dir:
+            raise ValueError(
+                "processed_dir or extract_dir is required for patch-based slice_interpolation. "
+                "This should point to the directory with preprocessed .pt files."
+            )
 
-    return get_slice_interpolation_dataloader(
-        data_dir=dataset_path,
-        config=config,
-        split=split
-    )
+        print(f"Loading CT Slice Interpolation data (PATCH-BASED MODE)")
+        print(f"Processed cache: {processed_dir}")
+        print(f"Patch config: {config.get('patch_depth_thick', 8)} thick → {config.get('patch_depth_thin', 48)} thin @ {config.get('patch_size', [192, 192])}")
+        print(f"Mode: 3D patches (fixed size, no padding, larger batches)")
+
+        return get_patch_dataloader(
+            processed_dir=processed_dir,
+            config=config,
+            split=split
+        )
+    else:
+        # Full-volume mode (original)
+        from .slice_interpolation_dataset import get_slice_interpolation_dataloader
+
+        dataset_path = config.get('dataset_path')
+        if not dataset_path:
+            raise ValueError("dataset_path is required for slice_interpolation data source")
+
+        print(f"Loading CT Slice Interpolation data (FULL-VOLUME MODE)")
+        print(f"Dataset path: {dataset_path}")
+        print(f"Task: Thick slices (50 @ 5.0mm) → Thin slices (300 @ 1.0mm)")
+        print(f"Mode: Full volumes (NO patches, NO downsampling)")
+
+        return get_slice_interpolation_dataloader(
+            data_dir=dataset_path,
+            config=config,
+            split=split
+        )
 
 
 def create_training_config(

@@ -3,6 +3,7 @@ from .transforms import VideoTransform
 from .ape_dataset import APEDataset, get_ape_dataloader
 from .ape_hf_dataset import APEHuggingFaceDataset, get_ape_hf_dataloader, inspect_hf_dataset
 from .get_dataloader import get_dataloader as get_unified_dataloader, create_training_config
+from .patch_slice_interpolation_dataset import PatchSliceInterpolationDataset, get_patch_dataloader
 
 __all__ = [
     'VideoDataset',
@@ -15,4 +16,6 @@ __all__ = [
     'inspect_hf_dataset',
     'get_unified_dataloader',
     'create_training_config',
+    'PatchSliceInterpolationDataset',
+    'get_patch_dataloader',
 ]

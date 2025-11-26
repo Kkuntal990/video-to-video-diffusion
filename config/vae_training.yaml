@@ -5,55 +5,66 @@
 # Model Configuration - Lightweight VAE
 model:
   in_channels: 1  # Grayscale CT scans
-  latent_dim: 4  # Standard latent dimension
-  vae_base_channels: 64  # Base channels for encoder/decoder
-  vae_scaling_factor: 0.18215  # Standard VAE scaling
+  latent_dim: 8  # Standard latent dimension
+  vae_base_channels: 128  # Base channels for encoder/decoder
+  vae_scaling_factor: 1.0  # Standard VAE scaling
 
   # No pretrained weights - train from scratch
   use_pretrained: false
   use_custom_maisi: false
   use_maisi: false
 
-# Data Configuration - Same as main training
+# Data Configuration - Patch-based for memory efficiency
 data:
   data_source: 'slice_interpolation'
   dataset_path: '/workspace/storage_a100/dataset'
   extract_dir: '/workspace/storage_a100/.cache/slice_interpolation_cache'
+  processed_dir: '/workspace/storage_a100/.cache/processed'  # Preprocessed .pt files
 
   categories: ['APE', 'non-APE']
 
-  # Full-volume configuration
-  use_full_volumes: true
-  max_thick_slices: 50  # Full thick volume depth
-  max_thin_slices: 300  # Full thin volume depth
-  resolution: [512, 512]
+  # Patch-based configuration (NEW!)
+  use_patches: true  # Enable patch-based training
+  patch_depth_thin: 48   # Number of thin slices in HR patch
+  patch_depth_thick: 8   # Number of thick slices in LR patch (6× ratio)
+  patch_size: [192, 192] # Spatial patch size (H, W)
+  augment: true          # Random flips and rotations (training only)
 
   # CT windowing
   window_center: 40
   window_width: 400
 
   # Train/Val/Test split
-  val_split: 0.15
-  test_split: 0.10
+  val_split: 0.1
+  test_split: 0.1
   seed: 42
 
-  # DataLoader settings
-  batch_size: 1  # Larger batch for VAE training
-  num_workers: 0
+  # Limit dataset size for debugging (null = use all samples)
+  max_train_samples: null  # Set to 2 for quick debug, null for full training
+  max_val_samples: null    # Limit validation samples (optional)
+
+  # DataLoader settings (increased batch size for patches!)
+  batch_size: 1
+  num_workers: 4
   pin_memory: true
   drop_last: true
 
 # VAE Training Configuration
 training:
-  num_epochs: 50  # VAEs converge quickly
+  num_epochs: 100  # VAEs converge quickly
   learning_rate: 0.0001  # 1e-4
-  weight_decay: 0.01
+  weight_decay: 0.00001
 
-  model_suffix: 'custom_vae'
+  model_suffix: 'custom_vae_o1'
+
+  # Slice sampling ratio during training
+  # Controls how often the VAE trains on thick vs thin slices
+  # Range: 0.0 (only thin) to 1.0 (only thick)
+  thick_slice_ratio: 0.2  # Default: 20% thick, 80% thin
 
   # Optimization
   optimizer: 'adamw'
-  gradient_accumulation_steps: 4  # Effective batch = 2×4 = 8
+  gradient_accumulation_steps: 4  # No accumulation needed with batch_size=8
   max_grad_norm: 1.0
 
   # Mixed precision
@@ -70,8 +81,8 @@ training:
   keep_last_n_checkpoints: 3
 
   # Validation
-  val_interval: 1  # Run validation every epoch (was 500 - caused validation to never run!)
-  num_validation_samples: 20  # Increased from 10 for better validation statistics
+  val_interval: 5  # Run validation every epoch (was 500 - caused validation to never run!)
+  num_validation_samples: 30  # Increased from 10 for better validation statistics
 
   # Logging
   log_interval: 50
@@ -92,9 +103,6 @@ losses:
   # Reconstruction loss (MSE)
   lambda_recon: 1.0
 
-  # KL divergence loss (for variational)
-  lambda_kl: 0.00001  # Very small to avoid posterior collapse
-
   # Perceptual loss (optional, helps quality)
   # DISABLED temporarily to save memory (VGG network is memory-intensive)
   use_perceptual_loss: false
@@ -102,7 +110,7 @@ losses:
   perceptual_every_n_steps: 10
 
   # MS-SSIM loss (helps preserve structure)
-  use_ms_ssim_loss: true
+  use_ms_ssim_loss: false
   lambda_ssim: 0.1
   ssim_every_n_steps: 10
 

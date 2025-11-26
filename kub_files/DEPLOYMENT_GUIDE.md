@@ -1,6 +1,6 @@
-# Kubernetes Deployment Guide for Video-to-Video Diffusion Training
+# Kubernetes Deployment Guide for CT Slice Interpolation Training
 
-This guide walks you through deploying and training your video-to-video diffusion model on a Kubernetes cluster (Nautilus/NRP).
+This guide walks you through deploying and training your CT slice interpolation model using latent diffusion on a Kubernetes cluster (Nautilus/NRP).
 
 ## Prerequisites
 

@@ -1,14 +1,14 @@
 # CT Slice Interpolation Training Configuration
 # Task: Thick slices (50 @ 5.0mm) → Thin slices (300 @ 1.0mm)
-# Architecture: Latent Diffusion with MAISI VAE (100% pretrained) + Medium U-Net (599M params)
+# Architecture: Latent Diffusion with Custom Trained VAE + Medium U-Net (599M params)
 # Data: Full volumes (NO patches) - 356 patients
 
 # Model Configuration - MEDIUM (599M params)
 model:
   in_channels: 1  # Grayscale CT scans
-  latent_dim: 4  # MAISI uses 4 latent channels
-  vae_base_channels: 64  # Not used with custom MAISI
-  vae_scaling_factor: 0.18215  # MAISI scaling factor
+  latent_dim: 8  # Custom VAE uses 8 latent channels
+  vae_base_channels: 128  # Match custom VAE training config
+  vae_scaling_factor: 1.0  # Custom VAE scaling factor
 
   # U-Net Configuration - MEDIUM MODEL (192 channels)
   unet_model_channels: 128  # ↑ from 128 (+50%) → 599M params total
@@ -24,16 +24,15 @@ model:
   beta_start: 0.0001
   beta_end: 0.02
 
-# Pretrained Weights - Custom MAISI VAE (100% Loading)
+# Pretrained Weights - Custom Trained VAE
 pretrained:
   use_pretrained: true
 
-  # Custom MAISI VAE
+  # Custom Trained VAE
   vae:
     enabled: true
-    use_custom_maisi: true  # Use custom MAISIVAE (130/130 params loaded)
-    checkpoint_path: '/workspace/storage_a100/pretrained/maisi_vae/models/autoencoder.pt'
-    freeze_epochs: 0  # VAE frozen from start
+    checkpoint_path: '/workspace/storage_a100/checkpoints/vae_training_custom_vae_o1/vae_best.pt'
+    freeze_epochs: 0  # VAE frozen from start (trained separately)
 
   # Training strategy
   two_phase_training: false  # Single-phase: U-Net only
@@ -41,14 +40,14 @@ pretrained:
 
   # Layer-wise learning rates
   layer_lr_multipliers:
-    vae_encoder: 0.0  # Frozen (pretrained MAISI)
-    vae_decoder: 0.0  # Frozen (pretrained MAISI)
+    vae_encoder: 0.0  # Frozen (pretrained custom VAE)
+    vae_decoder: 0.0  # Frozen (pretrained custom VAE)
     unet: 1.0  # Full learning rate
 
-# Data Configuration - FULL VOLUMES (Slice Interpolation) with Preprocessing Cache
+# Data Configuration - PATCH-BASED (Slice Interpolation) for Memory Efficiency
 data:
   # Data source for slice interpolation
-  data_source: 'slice_interpolation'  # Use new full-volume loader
+  data_source: 'slice_interpolation'  # Use slice interpolation loader
 
   # Local dataset path (PVC mounted)
   dataset_path: '/workspace/storage_a100/dataset'  # APE-data with .zip files
@@ -61,15 +60,17 @@ data:
   # 4. Keep only preprocessed .pt files (~15-20GB)
   # Subsequent runs load cached .pt files (very fast!)
   extract_dir: '/workspace/storage_a100/.cache/slice_interpolation_cache'
+  processed_dir: '/workspace/storage_a100/.cache/processed'  # Preprocessed .pt files
 
   # Categories
   categories: ['APE', 'non-APE']
 
-  # Full-volume configuration (NO downsampling!)
-  use_full_volumes: true
-  max_thick_slices: 50   # Keep up to 50 thick slices (5.0mm)
-  max_thin_slices: 300   # Keep up to 300 thin slices (1.0mm)
-  resolution: [512, 512]  # H, W - full resolution
+  # Patch-based configuration (NEW for memory efficiency!)
+  use_patches: true  # Enable patch-based training
+  patch_depth_thin: 48   # Number of thin slices in HR patch
+  patch_depth_thick: 8   # Number of thick slices in LR patch (6× ratio)
+  patch_size: [192, 192] # Spatial patch size (H, W)
+  augment: true          # Random flips and rotations (training only)
 
   # CT windowing
   window_center: 40   # HU for soft tissue
@@ -80,46 +81,59 @@ data:
   test_split: 0.10  # 10% test (≈36 patients)
   seed: 42
 
-  # DataLoader settings
-  batch_size: 1  # Lower for full volumes (memory constraint)
-  num_workers: 0  # 0 for DICOM to avoid multiprocessing issues
+  # DataLoader settings (INCREASED for patches!)
+  batch_size: 8  # Moderate batch size for custom VAE + UNet (changed from 16)
+  num_workers: 8  # Increased workers for patch sampling
   pin_memory: true
   drop_last: true
   cache_extracted: false  # Not needed - preprocessing pipeline deletes DICOMs automatically
 
 # Training Configuration
 training:
-  num_epochs: 100  # Longer training for slice interpolation
+  num_epochs: 300  # Increased for diffusion model convergence (was 100)
   learning_rate: 0.0001  # 1e-4
   weight_decay: 0.01
 
   # Model identification
-  model_suffix: 'slice_interp_full_medium'
+  model_suffix: 'slice_interp_full3'
 
   # Optimization
   optimizer: 'adamw'
-  gradient_accumulation_steps: 8  # Effective batch_size = 2×8 = 16
+  gradient_accumulation_steps: 2  # Effective batch = 8*2 = 16 (changed from 1)
   max_grad_norm: 1.0  # Gradient clipping
 
   # Mixed precision
   mixed_precision: true
   precision: 'bf16'  # BF16 for better stability and speed on A100
 
-  # Learning rate scheduling
-  scheduler: 'cosine'
-  warmup_steps: 1000
   min_lr: 0.000001
 
-  # Checkpointing
-  checkpoint_every: 2000  # Save every 2000 steps (reduced for speed)
-  keep_last_n_checkpoints: 3  # Keep last 3 checkpoints
+  # Checkpointing Strategy
+  # Only 2 checkpoints are saved:
+  # 1. Best checkpoint: Saved after patch validation if loss improves (tracked automatically)
+  # 2. Final checkpoint: Saved at end of training
+  # No intermediate checkpoints - saves disk space and keeps checkpoint dir clean
 
-  # Validation
-  val_interval: 1000  # Validate every 1000 steps
-  num_validation_samples: 20  # Increased for better validation statistics
+  # Validation Strategy (Multi-Tier)
+  # Tier 1: Loss-only validation (every epoch, fast)
+  val_interval: 1000  # Steps between loss-only validation (or set high for per-epoch)
+
+  # Tier 2: Patch-based validation with generation (periodic, medium cost)
+  patch_val_interval: 5  # Every N epochs - generates predictions on patches
+  patch_val_samples: 10  # Reduced from 40 to speed up validation (90% time reduction)
+  patch_val_generate: false  # Disabled generation for faster validation (use loss only)
+
+  # Tier 3: Full-volume validation (rare, expensive)
+  full_val_interval: 10000  # Every N epochs - full 512×512×300 volume generation
+  full_val_samples: 1  # Number of full volumes (very expensive!)
+
+  # Final validation (end of training)
+  final_val_enabled: true  # Run comprehensive validation after training
+  final_val_full_volumes: true  # Use full volumes for final validation
+  # Note: Final validation uses ALL validation samples (no limit)
 
   # Logging
-  log_interval: 50
+  log_interval: 100
   output_dir: '/workspace/storage_a100/outputs'
   log_dir: '/workspace/storage_a100/logs'
   checkpoint_dir: '/workspace/storage_a100/checkpoints'
@@ -130,21 +144,21 @@ training:
   wandb_project: 'ct-slice-interpolation'
   wandb_entity: null
 
-# Loss Configuration - Multi-Scale Losses (SOTA)
+# Loss Configuration - Pure MSE Baseline (for custom VAE testing)
 losses:
   # Primary loss: Diffusion (MSE on noise prediction)
   use_diffusion_loss: true
 
-  # Auxiliary losses (SOTA for medical imaging)
-  use_perceptual_loss: true
-  lambda_perceptual: 0.1  # Weight for VGG perceptual loss
+  # Auxiliary losses DISABLED for initial baseline (can re-enable later)
+  use_perceptual_loss: false  # Disabled for MSE-only baseline (changed from true)
+  lambda_perceptual: 0.0  # Weight for VGG perceptual loss (changed from 0.1)
   perceptual_every_n_steps: 10  # Compute every 10 steps (reduce overhead)
 
-  use_ms_ssim_loss: true
-  lambda_ssim: 0.1  # Weight for MS-SSIM loss
+  use_ms_ssim_loss: false  # Disabled for MSE-only baseline (changed from true)
+  lambda_ssim: 0.0  # Weight for MS-SSIM loss (changed from 0.1)
   ssim_every_n_steps: 10  # Compute every 10 steps
 
-  # Combined loss: L_total = L_diffusion + 0.1*L_perceptual + 0.1*L_ssim
+  # Current loss: L_total = L_diffusion (pure MSE)
 
 # Hardware Configuration
 hardware:
@@ -156,32 +170,13 @@ hardware:
   gradient_checkpointing: true  # Enable for 512×512×300 volumes
   cpu_offload: false
 
-# Inference Configuration
-inference:
-  sampler: 'ddim'
-  num_inference_steps: 50
-  guidance_scale: 1.0
-  save_samples: true
-  samples_per_validation: 3
 
-# Resume Training
-resume:
-  checkpoint_path: null  # Auto-detect best checkpoint
-  resume_optimizer: true
-  resume_scheduler: true
-
-# Early Stopping
-early_stopping:
-  enabled: true
-  patience: 15
-  metric: 'val_loss'
-  mode: 'min'
 
 # Expected Performance (CT Slice Interpolation with Full Volumes + Medium Model):
 #
 # 1. MODEL CAPACITY:
 #    - U-Net: 599M parameters (2.2× larger than baseline 270M)
-#    - VAE: 130M parameters (100% pretrained MAISI)
+#    - VAE: 130M parameters (custom trained)
 #    - Total: 729M parameters
 #    - Expected improvement: +1-2 dB PSNR over baseline
 #
@@ -214,7 +209,7 @@ early_stopping:
 #
 # 6. SOTA ALIGNMENT:
 #    - ✅ Latent diffusion (3D MedDiffusion 2024)
-#    - ✅ Pretrained medical VAE (MAISI)
+#    - ✅ Custom trained medical VAE
 #    - ✅ Perceptual loss (MSDSR 2024)
 #    - ✅ MS-SSIM loss (multi-scale quality)
 #    - ✅ Full-volume processing (no artificial downsampling)

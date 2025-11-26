@@ -51,59 +51,54 @@ class VideoToVideoDiffusion(nn.Module):
         if use_pretrained and pretrained_config.get('vae', {}).get('enabled', False):
             vae_config = pretrained_config['vae']
 
-            # Check if using custom MAISI VAE (100% weight loading)
-            if vae_config.get('use_custom_maisi', False):
-                print(f"Loading Custom MAISI VAE (100% pretrained weights)...")
+            # PRIORITY 1: Check if loading from local checkpoint path
+            if vae_config.get('checkpoint_path'):
+                # Create custom VAE architecture (checkpoint will be loaded later in train.py)
+                print(f"Creating custom VAE architecture (checkpoint will be loaded from {vae_config['checkpoint_path']})...")
+                model_config = config.get('model', config)
+                in_channels = model_config.get('in_channels', config.get('in_channels', 1))
+                base_channels = model_config.get('vae_base_channels', config.get('vae_base_channels', 128))
+                latent_dim = model_config.get('latent_dim', config.get('latent_dim', 8))
+                scaling_factor = model_config.get('vae_scaling_factor', config.get('vae_scaling_factor', 1.0))
+
                 self.vae = VideoVAE(
-                    in_channels=config.get('in_channels', 1),  # Grayscale for medical
-                    latent_dim=4,  # MAISI uses 4 latent channels
-                    use_custom_maisi=True,
-                    maisi_checkpoint=vae_config.get('checkpoint_path', None),
+                    in_channels=in_channels,
+                    latent_dim=latent_dim,
+                    base_channels=base_channels,
+                    scaling_factor=scaling_factor,
                     gradient_checkpointing=gradient_checkpointing
                 )
-            # Check if using MAISI VAE (medical imaging specific) - MONAI version
-            elif vae_config.get('use_maisi', False):
-                print(f"Loading MONAI MAISI VAE for medical CT imaging...")
-                stack_size = vae_config.get('stack_size', 4)  # Frames per 3D volume
-                self.vae = VideoVAE(
-                    in_channels=config.get('in_channels', 1),  # Grayscale for medical
-                    latent_dim=4,  # MAISI uses 4 latent channels (verified from checkpoint)
-                    use_maisi=True,
-                    maisi_checkpoint=vae_config.get('checkpoint_path', None),
-                    maisi_stack_size=stack_size,
-                    gradient_checkpointing=gradient_checkpointing
-                )
-            else:
+            # PRIORITY 2: Check if loading from HuggingFace model name
+            elif vae_config.get('model_name'):
                 # Load other pretrained VAE (SD VAE, etc.)
-                print(f"Loading pretrained VAE from {vae_config['model_name']}...")
+                print(f"Loading pretrained VAE from HuggingFace: {vae_config['model_name']}...")
                 self.vae = VideoVAE.from_pretrained(
                     vae_config['model_name'],
                     method=vae_config.get('method', 'auto'),
                     inflate_method=vae_config.get('inflate_method', 'central'),
                     device='cpu'  # Will be moved to correct device later
                 )
+            else:
+                # No checkpoint_path or model_name specified - should not reach here if config is correct
+                raise ValueError("VAE enabled but neither checkpoint_path nor model_name specified in config")
         else:
             # Train VAE from scratch
-            # Check if using MAISI-like architecture (grayscale + specific channel config)
             model_config = config.get('model', config)  # Handle nested model key
             in_channels = model_config.get('in_channels', config.get('in_channels', 3))
             base_channels = model_config.get('vae_base_channels', config.get('vae_base_channels', 64))
             latent_dim = model_config.get('latent_dim', config.get('latent_dim', 4))
             scaling_factor = model_config.get('vae_scaling_factor', config.get('vae_scaling_factor', 0.18215))
 
-            use_maisi_arch = (in_channels == 1 and base_channels == 64)  # MAISI pattern
-
             self.vae = VideoVAE(
                 in_channels=in_channels,
                 latent_dim=latent_dim,
                 base_channels=base_channels,
                 scaling_factor=scaling_factor,
-                use_maisi_arch=use_maisi_arch,  # Use MAISI architecture without pretrained weights
                 gradient_checkpointing=gradient_checkpointing
             )
 
         # U-Net for denoising
-        # Use latent_dim from VAE (3 for MAISI, 4 for custom)
+        # Use latent_dim from VAE
         actual_latent_dim = self.vae.latent_dim
         self.unet = UNet3D(
             latent_dim=actual_latent_dim,
@@ -164,13 +159,19 @@ class VideoToVideoDiffusion(nn.Module):
         """
         Forward pass for training
 
+        Supports two modes:
+        1. Full-volume mode: v_in and v_gt may have different depths (requires upsampling)
+        2. Patch-based mode: v_in and v_gt have same depth (no upsampling needed)
+
         Args:
             v_in: input video/volume (B, C, T_in, H, W)
-                  For slice interpolation: thick slices (T_in < T_gt)
+                  For patch-based: thick slices (T_in = T_gt in latent space)
+                  For full-volume: thick slices (T_in < T_gt)
             v_gt: ground truth video/volume (B, C, T_gt, H, W)
-                  For slice interpolation: thin slices (T_gt > T_in)
+                  For patch-based: thin slices (same latent depth as v_in)
+                  For full-volume: thin slices (T_gt > T_in)
             mask: optional padding mask (B, C, T_gt) where 1=real data, 0=padding
-                  CRITICAL for variable-depth batches to avoid learning on padding
+                  Only used in full-volume mode with variable-depth batches
 
         Returns:
             loss: training loss (scalar)
@@ -180,11 +181,11 @@ class VideoToVideoDiffusion(nn.Module):
         z_in = self.vae.encode(v_in)  # Conditioning latent
         z_gt = self.vae.encode(v_gt)  # Target latent for diffusion
 
-        # For slice interpolation: z_in may have different depth than z_gt
-        # Example: z_in = (B, 4, 12, 64, 64) for thick @ 5.0mm
-        #          z_gt = (B, 4, 62, 64, 64) for thin @ 1.0mm
-        # Need to upsample z_in to match z_gt depth for proper conditioning
+        # Handle depth mismatch (full-volume mode) or same-depth (patch-based mode)
         if z_in.shape[2] != z_gt.shape[2]:
+            # Full-volume mode: z_in has different depth than z_gt
+            # Example: z_in = (B, 4, 12, 64, 64) for thick @ 5.0mm
+            #          z_gt = (B, 4, 75, 64, 64) for thin @ 1.0mm
             # Upsample z_in along depth dimension to match z_gt
             z_in_upsampled = F.interpolate(
                 z_in,
@@ -192,39 +193,35 @@ class VideoToVideoDiffusion(nn.Module):
                 mode='trilinear',
                 align_corners=False
             )
-        else:
-            z_in_upsampled = z_in
 
-        # If mask provided, downsample it to match latent depth (VAE reduces depth by factor)
-        z_mask = None
-        if mask is not None:
-            # VAE downsamples depth by a factor (typically 4-6x for MAISI)
-            # Downsample mask to match z_gt depth: (B, C, T_gt) -> (B, C, T_latent)
-            # FIXED: Use nearest-neighbor interpolation to preserve binary mask
-            # This prevents quantization errors at boundaries (trilinear creates fractional values)
-            z_mask = F.interpolate(
-                mask.float().unsqueeze(-1).unsqueeze(-1),  # (B, C, T, 1, 1)
-                size=(z_gt.shape[2], 1, 1),  # Match latent depth
-                mode='nearest'  # Changed from 'trilinear' to preserve binary values
-            ).squeeze(-1).squeeze(-1)  # (B, C, T_latent)
-            # No binarization needed with nearest-neighbor (already binary: 0 or 1)
+            # Downsample mask to match latent depth
+            z_mask = None
+            if mask is not None:
+                z_mask = F.interpolate(
+                    mask.float().unsqueeze(-1).unsqueeze(-1),  # (B, C, T, 1, 1)
+                    size=(z_gt.shape[2], 1, 1),  # Match latent depth
+                    mode='nearest'  # Preserve binary values
+                ).squeeze(-1).squeeze(-1)  # (B, C, T_latent)
+        else:
+            # Patch-based mode: same depth, no upsampling needed
+            # z_in = z_gt in shape (e.g., both (B, 4, 48, 24, 24) for patches)
+            z_in_upsampled = z_in
+            z_mask = mask  # Mask can be used as-is (or typically None for patches)
 
         # Compute diffusion loss (with optional MS-SSIM)
-        # Note: use_ssim and ssim_weight should be set in config
-        # For now, defaulting to MSE only to maintain backward compatibility
         loss, loss_dict = self.diffusion.training_loss(
-            self.unet, z_gt, z_in_upsampled,  # Use upsampled conditioning
-            mask=z_mask,  # Pass latent-space mask
+            self.unet, z_gt, z_in_upsampled,
+            mask=z_mask,
             vae=self.vae,
             v_gt=v_gt,
             use_ssim=False,  # Can be enabled via config
-            ssim_weight=0.0   # Can be set via config (e.g., 0.2)
+            ssim_weight=0.0   # Can be set via config
         )
 
         # Additional metrics
         metrics = {
             'loss': loss.item(),
-            **loss_dict  # Include individual loss components
+            **loss_dict
         }
 
         return loss, metrics
@@ -247,17 +244,39 @@ class VideoToVideoDiffusion(nn.Module):
             v_out: generated video/volume (B, C, T_out, H, W)
                    For slice interpolation: thin slices (T_out > T_in)
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         device = v_in.device
         B, C, T_in, H, W = v_in.shape
 
+        # CRITICAL: Force FP32 for numerical stability during inference
+        # Mixed precision (BF16/FP16) can cause NaN due to underflow in DDIM sampling
+        original_dtype = v_in.dtype
+        if original_dtype != torch.float32:
+            logger.info(f"Inference: Converting from {original_dtype} to FP32 for numerical stability")
+            v_in = v_in.float()
+
+        # Check input for NaN
+        if torch.isnan(v_in).any():
+            logger.error(f"NaN detected in input v_in! Count: {torch.isnan(v_in).sum()}")
+            v_in = torch.nan_to_num(v_in, nan=0.0)
+
         # Encode input video to get conditioning
         with torch.no_grad():
-            z_in = self.vae.encode(v_in)  # (B, latent_dim, T_latent_in, h, w)
+            # Ensure VAE operates in FP32
+            with torch.cuda.amp.autocast(enabled=False):
+                z_in = self.vae.encode(v_in)  # (B, latent_dim, T_latent_in, h, w)
+
+            # CHECKPOINT: Check encoded latent for NaN
+            if torch.isnan(z_in).any() or torch.isinf(z_in).any():
+                logger.error(f"NaN/Inf in z_in after VAE encode! NaN: {torch.isnan(z_in).sum()}, Inf: {torch.isinf(z_in).sum()}")
+                z_in = torch.nan_to_num(z_in, nan=0.0, posinf=1.0, neginf=-1.0)
 
             # Determine target latent shape
             if target_depth is not None:
                 # For slice interpolation: need to determine latent depth from target depth
-                # MAISI compresses depth by 4×: D_latent = D / 4
+                # VAE compresses depth by 4×: D_latent = D / 4
                 latent_depth_target = target_depth // 4
 
                 # Upsample z_in to target latent depth
@@ -268,6 +287,11 @@ class VideoToVideoDiffusion(nn.Module):
                     align_corners=False
                 )
 
+                # CHECKPOINT: Check upsampled latent for NaN
+                if torch.isnan(z_in_upsampled).any() or torch.isinf(z_in_upsampled).any():
+                    logger.error(f"NaN/Inf in z_in_upsampled! NaN: {torch.isnan(z_in_upsampled).sum()}, Inf: {torch.isinf(z_in_upsampled).sum()}")
+                    z_in_upsampled = torch.nan_to_num(z_in_upsampled, nan=0.0, posinf=1.0, neginf=-1.0)
+
                 latent_shape = z_in_upsampled.shape
             else:
                 # Standard video-to-video: same depth
@@ -277,31 +301,43 @@ class VideoToVideoDiffusion(nn.Module):
             # Initialize with random noise
             z_t = torch.randn(latent_shape, device=device)
 
-            # Denoise using specified sampler
-            if sampler == 'ddpm':
-                # Use built-in DDPM sampling from diffusion
-                z_0 = self.diffusion.p_sample_loop(
-                    self.unet,
-                    latent_shape,
-                    z_in_upsampled,
-                    device,
-                    progress=True
-                )
-            elif sampler == 'ddim':
-                # DDIM sampling (will be implemented in sampler.py)
-                from inference.sampler import DDIMSampler
-                ddim_sampler = DDIMSampler(self.diffusion, self.unet)
-                z_0 = ddim_sampler.sample(
-                    latent_shape,
-                    z_in_upsampled,
-                    num_inference_steps,
-                    device
-                )
-            else:
-                raise ValueError(f"Unknown sampler: {sampler}")
+            # Denoise using specified sampler (in FP32)
+            with torch.cuda.amp.autocast(enabled=False):
+                if sampler == 'ddpm':
+                    # Use built-in DDPM sampling from diffusion
+                    z_0 = self.diffusion.p_sample_loop(
+                        self.unet,
+                        latent_shape,
+                        z_in_upsampled,
+                        device,
+                        progress=True
+                    )
+                elif sampler == 'ddim':
+                    # DDIM sampling (will be implemented in sampler.py)
+                    from inference.sampler import DDIMSampler
+                    ddim_sampler = DDIMSampler(self.diffusion, self.unet)
+                    z_0 = ddim_sampler.sample(
+                        latent_shape,
+                        z_in_upsampled,
+                        num_inference_steps,
+                        device
+                    )
+                else:
+                    raise ValueError(f"Unknown sampler: {sampler}")
 
-            # Decode latent to video
-            v_out = self.vae.decode(z_0)
+            # CHECKPOINT: Check sampled latent for NaN
+            if torch.isnan(z_0).any() or torch.isinf(z_0).any():
+                logger.error(f"NaN/Inf in z_0 after sampling! NaN: {torch.isnan(z_0).sum()}, Inf: {torch.isinf(z_0).sum()}")
+                z_0 = torch.nan_to_num(z_0, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            # Decode latent to video (in FP32)
+            with torch.cuda.amp.autocast(enabled=False):
+                v_out = self.vae.decode(z_0)
+
+            # CHECKPOINT: Check decoded output for NaN
+            if torch.isnan(v_out).any() or torch.isinf(v_out).any():
+                logger.error(f"NaN/Inf in v_out after VAE decode! NaN: {torch.isnan(v_out).sum()}, Inf: {torch.isinf(v_out).sum()}")
+                v_out = torch.nan_to_num(v_out, nan=0.0, posinf=1.0, neginf=-1.0)
 
         return v_out
 
@@ -350,35 +386,6 @@ class VideoToVideoDiffusion(nn.Module):
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
 
-    @classmethod
-    def load_checkpoint(cls, path, device='cpu'):
-        """
-        Load model from checkpoint
-
-        Args:
-            path: checkpoint path
-            device: device to load model on
-
-        Returns:
-            model: loaded model
-            checkpoint: full checkpoint dict (contains optimizer state, etc.)
-        """
-        # weights_only=False is required to load optimizer/scheduler states
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
-
-        # Create model from config
-        model = cls(checkpoint['config'])
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-
-        print(f"Model loaded from {path}")
-        if 'epoch' in checkpoint:
-            print(f"Checkpoint epoch: {checkpoint['epoch']}")
-        if 'global_step' in checkpoint:
-            print(f"Checkpoint global step: {checkpoint['global_step']}")
-
-        return model, checkpoint
-
     def count_parameters(self):
         """
         Count model parameters (both total and trainable)
@@ -395,15 +402,9 @@ class VideoToVideoDiffusion(nn.Module):
         # Count trainable parameters
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-        # Handle custom MAISI VAE which is nested in self.vae.maisi_vae
-        # Count ALL MAISI parameters (even if frozen) to show the full model size
-        if hasattr(self.vae, 'maisi_vae') and self.vae.maisi_vae is not None:
-            vae_params = sum(p.numel() for p in self.vae.maisi_vae.parameters())
-            vae_trainable = sum(p.numel() for p in self.vae.maisi_vae.parameters() if p.requires_grad)
-        else:
-            # Regular VAE - count all parameters
-            vae_params = sum(p.numel() for p in self.vae.parameters())
-            vae_trainable = sum(p.numel() for p in self.vae.parameters() if p.requires_grad)
+        # VAE parameters (count all, including frozen)
+        vae_params = sum(p.numel() for p in self.vae.parameters())
+        vae_trainable = sum(p.numel() for p in self.vae.parameters() if p.requires_grad)
 
         # U-Net parameters (trainable only)
         unet_params = sum(p.numel() for p in self.unet.parameters() if p.requires_grad)

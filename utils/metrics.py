@@ -60,13 +60,26 @@ def calculate_ssim(img1, img2, window_size=11, max_val=1.0):
         ssim: SSIM value in [0, 1]
 
     Note:
-        For 5D tensors (3D volumes), SSIM is computed on the middle slice
+        For 5D tensors (3D volumes), SSIM is computed across all slices and averaged
     """
-    # Handle 5D tensors (3D volumes) by using middle slice
+    # Handle 5D tensors (3D volumes) by computing SSIM per slice and averaging
     if img1.ndim == 5:  # (B, C, D, H, W)
-        mid_slice = img1.shape[2] // 2
-        img1 = img1[:, :, mid_slice, :, :]  # Extract middle slice → (B, C, H, W)
-        img2 = img2[:, :, mid_slice, :, :]
+        B, C, D, H, W = img1.shape
+        ssim_values = []
+
+        # Compute SSIM for each slice
+        for d in range(D):
+            slice1 = img1[:, :, d, :, :]  # (B, C, H, W)
+            slice2 = img2[:, :, d, :, :]
+
+            # Compute SSIM for this slice (recursive call with 4D input)
+            ssim_d = calculate_ssim(slice1, slice2, window_size, max_val)
+            ssim_values.append(ssim_d)
+
+        # Return average SSIM across all slices
+        return sum(ssim_values) / len(ssim_values) if ssim_values else 0.0
+
+    # For 4D tensors, compute SSIM normally (below)
 
     # FIXED: Add numerical stability constants
     C1 = (0.01 * max_val) ** 2

@@ -1,4 +1,4 @@
-# Video-to-Video Diffusion Model Architecture
+# Slice interpolation latent diffusion architecture
 
 Complete architecture specification with layer dimensions and data flow diagrams.
 
@@ -17,19 +17,20 @@ Complete architecture specification with layer dimensions and data flow diagrams
 
 ## Overview
 
-**Model Type**: Video-to-Video Diffusion with 3D VAE
-**Task**: Medical CT scan reconstruction and enhancement
-**Input**: Source CT video (8 slices, 128×128)
-**Output**: Enhanced CT video (8 slices, 128×128)
+**Model Type**: Latent Diffusion for CT Slice Interpolation
+**Task**: Anisotropic super-resolution (50 thick slices @ 5mm → 300 thin slices @ 1mm)
+**Input**: Thick CT slices (8 slices @ 5mm, 512×512) - patch-based
+**Output**: Thin CT slices (48 slices @ 1mm, 512×512) - patch-based
 
 ### High-Level Architecture
 
 ```
-Input Video (B×3×8×128×128)
+Input CT Patch (B×1×8×192×192) - Thick slices @ 5mm
           ↓
     ┌─────────────┐
-    │   VAE       │  Encode to latent space
-    │   Encoder   │  (B×4×8×16×16)
+    │   Custom    │  Encode to latent space
+    │   VAE       │  8× spatial compression
+    │   Encoder   │  (B×8×8×24×24)
     └─────────────┘
           ↓
     ┌─────────────┐
@@ -38,26 +39,29 @@ Input Video (B×3×8×128×128)
     └─────────────┘
           ↓
     ┌─────────────┐
-    │   U-Net     │  Denoise latent
-    │   Denoiser  │  (B×4×8×16×16)
-    └─────────────┘
+    │   3D U-Net  │  Denoise latent conditioned
+    │   Denoiser  │  on thick slice encoding
+    └─────────────┘  (B×8×48×24×24)
           ↓
     ┌─────────────┐
-    │   VAE       │  Decode to video
-    │   Decoder   │  (B×3×8×128×128)
+    │   Custom    │  Decode to CT volume
+    │   VAE       │  8× spatial upsampling
+    │   Decoder   │  (B×1×48×192×192)
     └─────────────┘
           ↓
-Output Video (B×3×8×128×128)
+Output CT Patch (B×1×48×192×192) - Thin slices @ 1mm
 ```
 
 ### Model Statistics
 
 | Component | Parameters | Input Shape | Output Shape |
 |-----------|-----------|-------------|--------------|
-| **VAE Encoder** | 86M | (B,3,8,128,128) | (B,4,8,16,16) |
-| **VAE Decoder** | 86M | (B,4,8,16,16) | (B,3,8,128,128) |
-| **U-Net (4-level)** | 270M | (B,4,8,16,16) | (B,4,8,16,16) |
-| **Total** | **441M** | - | - |
+| **VAE Encoder** | 87M | (B,1,D,512,512) | (B,8,D,64,64) |
+| **VAE Decoder** | 87M | (B,8,D,64,64) | (B,1,D,512,512) |
+| **U-Net (4-level)** | 265M | (B,8,D,64,64) | (B,8,D,64,64) |
+| **Total** | **437M** | - | - |
+
+**Note:** VAE is frozen during diffusion training (trained separately)
 
 **Compression Ratio**: 8× spatial (128→16), no temporal compression
 
