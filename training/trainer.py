@@ -33,6 +33,7 @@ class Trainer:
         scheduler,
         train_dataloader,
         val_dataloader=None,
+        full_val_dataloader=None,
         config=None,
         device='cuda',
         log_dir='logs',
@@ -45,7 +46,8 @@ class Trainer:
             optimizer: optimizer
             scheduler: learning rate scheduler
             train_dataloader: training data loader
-            val_dataloader: validation data loader (optional)
+            val_dataloader: patch-based validation data loader (for Tier 1 & 2)
+            full_val_dataloader: full-volume validation data loader (for Tier 3) (optional)
             config: training config dict
             device: training device
             log_dir: directory for TensorBoard logs
@@ -57,6 +59,7 @@ class Trainer:
         self.scheduler = scheduler
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.full_val_dataloader = full_val_dataloader
         self.device = device
         self.config = config or {}
         self.pretrained_config = pretrained_config or {}
@@ -84,9 +87,25 @@ class Trainer:
             logger.info(f"VAE will be frozen for first {self.vae_freeze_epochs} epochs")
         self.gradient_accumulation_steps = self.config.get('gradient_accumulation_steps', 1)
         self.use_amp = self.config.get('use_amp', True)
+
+        # Configure precision dtype for AMP
+        precision_str = self.config.get('precision', 'fp16')
+        if precision_str == 'bf16':
+            self.amp_dtype = torch.bfloat16
+        elif precision_str == 'fp16':
+            self.amp_dtype = torch.float16
+        else:
+            self.amp_dtype = torch.float16  # Default to FP16
+
         self.log_interval = self.config.get('log_interval', 10)
         self.val_interval = self.config.get('val_interval', 1000)
-        self.checkpoint_interval = self.config.get('checkpoint_interval', 5000)
+
+        # Multi-tier validation settings
+        self.patch_val_interval = self.config.get('patch_val_interval', 5)  # Every N epochs
+        self.patch_val_samples = self.config.get('patch_val_samples', 10)  # Number of patches
+        self.patch_val_generate = self.config.get('patch_val_generate', True)  # Generate predictions
+        self.full_val_interval = self.config.get('full_val_interval', 15)  # Every N epochs
+        self.full_val_samples = self.config.get('full_val_samples', 2)  # Number of full volumes
 
         # Setup directories
         self.log_dir = Path(log_dir)
@@ -105,6 +124,7 @@ class Trainer:
         self.current_epoch = 0
         self.best_loss = float('inf')  # Track best validation/training loss
         self.best_checkpoint_path = None  # Track path to best checkpoint
+        self.just_resumed_checkpoint = False  # Flag to clear CUDA cache after checkpoint resume
 
         print(f"Trainer initialized:")
         print(f"  Device: {device}")
@@ -112,6 +132,8 @@ class Trainer:
         print(f"  Model suffix: {self.model_suffix if self.model_suffix else 'None'}")
         print(f"  Gradient accumulation: {self.gradient_accumulation_steps}")
         print(f"  Mixed precision: {self.use_amp}")
+        if self.use_amp:
+            print(f"  AMP dtype: {self.amp_dtype}")
         print(f"  Log dir: {self.log_dir}")
         print(f"  Checkpoint dir: {self.checkpoint_dir}")
 
@@ -158,31 +180,47 @@ class Trainer:
         """Train for one epoch"""
         self.model.train()
 
+        # Clear CUDA cache if this is first epoch after checkpoint resume
+        # This ensures checkpoint loading artifacts don't consume memory
+        if self.just_resumed_checkpoint:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"✓ CUDA cache cleared after checkpoint resume")
+            self.just_resumed_checkpoint = False  # Reset flag
+
         # Clear any leftover accumulated gradients from previous epoch
         # This is critical when gradient_accumulation_steps doesn't divide evenly into num_batches
         # Example: 243 batches % 8 steps = 3 leftover batches that never called optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
-        epoch_losses = []  # Store loss tensors to avoid repeated CPU-GPU sync
         epoch_loss_sum = 0.0
         epoch_loss_count = 0
+
+        # Timer instrumentation to measure data loading vs compute time
+        data_time = 0.0
+        step_time = 0.0
 
         pbar = tqdm(self.train_dataloader, desc=f"Epoch {self.current_epoch}")
 
         for batch_idx, batch in enumerate(pbar):
-            # Move data to device
-            v_in = batch['input'].to(self.device)
-            v_gt = batch['target'].to(self.device)
+            t0 = time.time()
 
-            # Extract padding mask for target (thin slices) - CRITICAL for variable depths!
-            # Prevents model from learning on zero-padded regions
+            # Move data to device (non-blocking for async transfer)
+            v_in = batch['input'].to(self.device, non_blocking=True)
+            v_gt = batch['target'].to(self.device, non_blocking=True)
+
+            # Extract padding mask (if available)
+            # Full-volume mode: mask prevents learning on padded regions (variable depths)
+            # Patch-based mode: mask=None (all patches have fixed size, no padding)
             mask = batch.get('thin_mask', None)
             if mask is not None:
-                mask = mask.to(self.device)
+                mask = mask.to(self.device, non_blocking=True)
+
+            t1 = time.time()
 
             # Forward pass with mixed precision
             if self.use_amp:
-                with autocast():
+                with autocast(dtype=self.amp_dtype):
                     loss, metrics = self.model(v_in, v_gt, mask=mask)
                     loss = loss / self.gradient_accumulation_steps
             else:
@@ -205,13 +243,17 @@ class Trainer:
 
                 self.optimizer.zero_grad(set_to_none=True)  # Faster memory release
 
-            # Update global step
-            self.global_step += 1
+                # Update global step (only after optimizer step, not per micro-batch)
+                self.global_step += 1
 
             # Track loss for epoch average (minimize CPU-GPU sync)
             with torch.no_grad():
                 epoch_loss_sum += (loss * self.gradient_accumulation_steps).detach()
                 epoch_loss_count += 1
+
+            t2 = time.time()
+            data_time += (t1 - t0)
+            step_time += (t2 - t1)
 
             # Log metrics only at intervals
             if self.global_step % self.log_interval == 0:
@@ -221,14 +263,22 @@ class Trainer:
                 self.writer.add_scalar('train/loss', loss_value, self.global_step)
                 self.writer.add_scalar('train/lr', lr, self.global_step)
 
-                pbar.set_postfix({
-                    'loss': f'{loss_value:.4f}',
-                    'lr': f'{lr:.2e}',
-                    'step': self.global_step
-                })
-
-                # Periodic garbage collection to prevent RAM buildup
-                gc.collect()
+                # Update progress bar with timing info every 50 batches
+                if batch_idx > 0 and batch_idx % 50 == 0:
+                    avg_data = data_time / batch_idx
+                    avg_step = step_time / batch_idx
+                    pbar.set_postfix({
+                        'loss': f'{loss_value:.4f}',
+                        'lr': f'{lr:.2e}',
+                        'data_t': f'{avg_data:.3f}s',
+                        'step_t': f'{avg_step:.3f}s',
+                    })
+                else:
+                    pbar.set_postfix({
+                        'loss': f'{loss_value:.4f}',
+                        'lr': f'{lr:.2e}',
+                        'step': self.global_step
+                    })
 
             # Validation
             if self.val_dataloader and self.global_step % self.val_interval == 0:
@@ -236,16 +286,16 @@ class Trainer:
                 self.writer.add_scalar('val/loss', val_loss, self.global_step)
                 self.model.train()
 
-            # Save checkpoint
-            if self.global_step % self.checkpoint_interval == 0:
-                step_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_step_{self.global_step}.pt')
-                self.save_checkpoint(step_checkpoint_filename)
-
         # Handle any remaining accumulated gradients at end of epoch
         # If num_batches % gradient_accumulation_steps != 0, there will be leftover gradients
         # Example: 243 batches % 8 = 3 leftover batches that accumulated but never stepped
-        num_batches = len(self.train_dataloader)
-        if num_batches % self.gradient_accumulation_steps != 0:
+        try:
+            num_batches = len(self.train_dataloader)
+        except TypeError:
+            # Streaming dataset without __len__(), no leftover gradients possible
+            num_batches = None
+
+        if num_batches is not None and num_batches % self.gradient_accumulation_steps != 0:
             # Step the optimizer with remaining accumulated gradients
             if self.use_amp:
                 self.scaler.step(self.optimizer)
@@ -263,11 +313,6 @@ class Trainer:
             logger.warning("No batches were processed in this epoch!")
             avg_loss = 0.0
 
-        # Force garbage collection after epoch completes to free RAM
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         return avg_loss
 
     @torch.no_grad()
@@ -275,8 +320,8 @@ class Trainer:
         """Run validation with SSIM and PSNR metrics"""
         self.model.eval()
 
-        # Use streaming average instead of list accumulation to save RAM
-        val_loss_sum = 0.0
+        # Accumulate losses as tensors on GPU (avoid GPU-CPU sync)
+        val_losses = []
         psnr_sum = 0.0
         ssim_sum = 0.0
         val_count = 0
@@ -289,37 +334,45 @@ class Trainer:
             # Stop after max_samples to speed up validation
             if val_count >= max_samples:
                 break
-            v_in = batch['input'].to(self.device)
-            v_gt = batch['target'].to(self.device)
+            v_in = batch['input'].to(self.device, non_blocking=True)
+            v_gt = batch['target'].to(self.device, non_blocking=True)
 
             # Forward pass for loss
             if self.use_amp:
-                with autocast():
+                with autocast(dtype=self.amp_dtype):
                     loss, metrics = self.model(v_in, v_gt)
             else:
                 loss, metrics = self.model(v_in, v_gt)
 
             # Generate prediction for SSIM/PSNR calculation
-            # Sample from the diffusion model using generate() method
+            # Note: For patch-based training, we skip generation metrics during validation
+            # (patches are too small for meaningful PSNR/SSIM, and we'd need stitching for full volumes)
             try:
-                # For slice interpolation, pass target depth from ground truth
-                target_depth = v_gt.shape[2]  # Get depth from ground truth (300 thin slices)
+                # Detect if we're in patch mode (small spatial dimensions = patches)
+                _, _, _, H, W = v_gt.shape
+                is_patch_mode = (H < 256) or (W < 256)  # Patches are typically 192×192 or smaller
 
-                if self.use_amp:
-                    with autocast():
+                if not is_patch_mode:
+                    # Full-volume mode: generate prediction and compute metrics
+                    target_depth = v_gt.shape[2]  # Get depth from ground truth
+
+                    # CRITICAL: Always generate in FP32 for numerical stability
+                    with torch.cuda.amp.autocast(enabled=False):
                         v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
+
+                    # Calculate SSIM and PSNR metrics
+                    v_pred_clamped = torch.clamp(v_pred, -1, 1)
+                    v_gt_clamped = torch.clamp(v_gt, -1, 1)
+
+                    # PSNR max_val should be range size: 2.0 for [-1, 1]
+                    video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+                    psnr_sum += video_metrics['psnr']
+                    ssim_sum += video_metrics['ssim']
                 else:
-                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
-
-                # Calculate SSIM and PSNR metrics
-                # Clamp values to [-1, 1] range (matching dataset normalization)
-                v_pred_clamped = torch.clamp(v_pred, -1, 1)
-                v_gt_clamped = torch.clamp(v_gt, -1, 1)
-
-                # PSNR max_val should be range size: 2.0 for [-1, 1]
-                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
-                psnr_sum += video_metrics['psnr']
-                ssim_sum += video_metrics['ssim']
+                    # Patch-based mode: skip generation metrics (use loss only)
+                    # For full-volume metrics, use separate inference script with stitching
+                    psnr_sum += 0.0
+                    ssim_sum += 0.0
             except Exception as e:
                 # If sampling fails, skip metrics
                 import logging
@@ -328,18 +381,17 @@ class Trainer:
                 psnr_sum += 0.0
                 ssim_sum += 0.0
 
-            # Accumulate loss sum
-            val_loss_sum += loss.item()
+            # Accumulate loss tensor (avoid GPU-CPU sync)
+            val_losses.append(loss.detach())
             val_count += 1
 
             pbar.set_postfix({
-                'val_loss': f'{loss.item():.4f}',
                 'psnr': f'{psnr_sum/val_count:.2f}' if val_count > 0 else 'N/A',
                 'ssim': f'{ssim_sum/val_count:.4f}' if val_count > 0 else 'N/A'
             })
 
-        # Calculate averages
-        avg_val_loss = val_loss_sum / val_count if val_count > 0 else 0.0
+        # Calculate averages (single GPU-CPU sync at end)
+        avg_val_loss = torch.stack(val_losses).mean().item() if len(val_losses) > 0 else 0.0
         avg_psnr = psnr_sum / val_count if val_count > 0 else 0.0
         avg_ssim = ssim_sum / val_count if val_count > 0 else 0.0
 
@@ -350,11 +402,281 @@ class Trainer:
         self.writer.add_scalar('val/ssim', avg_ssim, self.global_step)
 
         # Clean up after validation
-        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return avg_val_loss
+
+    @torch.no_grad()
+    def validate_loss_only(self):
+        """
+        Tier 1: Quick loss-only validation (no generation, no metrics)
+        Runs every epoch for fast monitoring
+        """
+        self.model.eval()
+
+        val_losses = []
+        max_samples = 5  # Only check a few batches for speed
+
+        for batch in self.val_dataloader:
+            if len(val_losses) >= max_samples:
+                break
+
+            v_in = batch['input'].to(self.device, non_blocking=True)
+            v_gt = batch['target'].to(self.device, non_blocking=True)
+
+            # Compute loss only (no generation)
+            if self.use_amp:
+                with autocast(dtype=self.amp_dtype):
+                    loss, _ = self.model(v_in, v_gt)
+            else:
+                loss, _ = self.model(v_in, v_gt)
+
+            val_losses.append(loss.detach())
+
+        avg_loss = torch.stack(val_losses).mean().item() if len(val_losses) > 0 else 0.0
+        print(f"  [Tier 1] Val Loss (quick): {avg_loss:.4f}")
+        self.writer.add_scalar('val/loss_only', avg_loss, self.current_epoch)
+
+        self.model.train()
+        return avg_loss
+
+    @torch.no_grad()
+    def validate_patches(self, max_samples=10, generate=True):
+        """
+        Tier 2: Patch-based validation with generation
+        Computes PSNR/SSIM on patches, used for checkpoint selection
+        """
+        self.model.eval()
+
+        val_losses = []
+        psnr_sum = 0.0
+        ssim_sum = 0.0
+        val_count = 0
+
+        pbar = tqdm(self.val_dataloader, desc="[Tier 2] Patch Validation", total=max_samples)
+
+        for batch in pbar:
+            if val_count >= max_samples:
+                break
+
+            v_in = batch['input'].to(self.device, non_blocking=True)
+            v_gt = batch['target'].to(self.device, non_blocking=True)
+
+            # Compute loss
+            if self.use_amp:
+                with autocast(dtype=self.amp_dtype):
+                    loss, _ = self.model(v_in, v_gt)
+            else:
+                loss, _ = self.model(v_in, v_gt)
+
+            val_losses.append(loss.detach())
+
+            # Generate predictions and compute metrics (if enabled)
+            if generate:
+                try:
+                    target_depth = v_gt.shape[2]
+
+                    # CRITICAL: Always generate in FP32 for numerical stability
+                    # model.generate() internally disables autocast, but we disable it here too
+                    # to ensure no mixed precision artifacts from outer context
+                    with torch.cuda.amp.autocast(enabled=False):
+                        v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
+
+                    # Compute metrics on patches
+                    v_pred_clamped = torch.clamp(v_pred, -1, 1)
+                    v_gt_clamped = torch.clamp(v_gt, -1, 1)
+                    video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+
+                    psnr_sum += video_metrics['psnr']
+                    ssim_sum += video_metrics['ssim']
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Patch generation failed: {e}")
+                    psnr_sum += 0.0
+                    ssim_sum += 0.0
+
+            val_count += 1
+            pbar.set_postfix({
+                'psnr': f'{psnr_sum/val_count:.2f}' if generate and val_count > 0 else 'N/A',
+                'ssim': f'{ssim_sum/val_count:.4f}' if generate and val_count > 0 else 'N/A'
+            })
+
+        # Calculate averages (single GPU-CPU sync at end)
+        avg_loss = torch.stack(val_losses).mean().item() if len(val_losses) > 0 else 0.0
+        avg_psnr = psnr_sum / val_count if val_count > 0 else 0.0
+        avg_ssim = ssim_sum / val_count if val_count > 0 else 0.0
+
+        print(f"  [Tier 2] Patch Val - Loss: {avg_loss:.4f}, PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}")
+
+        # Log to TensorBoard
+        self.writer.add_scalar('val/patch_loss', avg_loss, self.current_epoch)
+        if generate:
+            self.writer.add_scalar('val/patch_psnr', avg_psnr, self.current_epoch)
+            self.writer.add_scalar('val/patch_ssim', avg_ssim, self.current_epoch)
+
+        self.model.train()
+        return {'loss': avg_loss, 'psnr': avg_psnr, 'ssim': avg_ssim}
+
+    @torch.no_grad()
+    def validate_full_volumes(self, max_samples=2):
+        """
+        Tier 3: Full-volume validation with generation
+        Expensive, runs rarely during training
+        """
+        self.model.eval()
+
+        val_losses = []
+        psnr_sum = 0.0
+        ssim_sum = 0.0
+        val_count = 0
+
+        print(f"\n  [Tier 3] Full-Volume Validation (n={max_samples})...")
+
+        for batch in tqdm(self.full_val_dataloader, desc="Full-Volume Val", total=max_samples):
+            if val_count >= max_samples:
+                break
+
+            v_in = batch['input'].to(self.device, non_blocking=True)  # (B, 1, 50, 512, 512)
+            v_gt = batch['target'].to(self.device, non_blocking=True)  # (B, 1, 300, 512, 512)
+
+            # Compute loss
+            if self.use_amp:
+                with autocast(dtype=self.amp_dtype):
+                    loss, _ = self.model(v_in, v_gt)
+            else:
+                loss, _ = self.model(v_in, v_gt)
+
+            val_losses.append(loss.detach())
+
+            # Generate full volumes with DDIM
+            try:
+                target_depth = v_gt.shape[2]
+
+                # CRITICAL: Always generate in FP32 for numerical stability
+                with torch.cuda.amp.autocast(enabled=False):
+                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
+
+                # Compute metrics on full volumes
+                v_pred_clamped = torch.clamp(v_pred, -1, 1)
+                v_gt_clamped = torch.clamp(v_gt, -1, 1)
+                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+
+                psnr_sum += video_metrics['psnr']
+                ssim_sum += video_metrics['ssim']
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Full-volume generation failed: {e}")
+                psnr_sum += 0.0
+                ssim_sum += 0.0
+
+            val_count += 1
+
+        # Calculate averages (single GPU-CPU sync at end)
+        avg_loss = torch.stack(val_losses).mean().item() if len(val_losses) > 0 else 0.0
+        avg_psnr = psnr_sum / val_count if val_count > 0 else 0.0
+        avg_ssim = ssim_sum / val_count if val_count > 0 else 0.0
+
+        print(f"  [Tier 3] Full-Volume Val - Loss: {avg_loss:.4f}, PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}\n")
+
+        # Log to TensorBoard
+        self.writer.add_scalar('val/full_loss', avg_loss, self.current_epoch)
+        self.writer.add_scalar('val/full_psnr', avg_psnr, self.current_epoch)
+        self.writer.add_scalar('val/full_ssim', avg_ssim, self.current_epoch)
+
+        # Clean up
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.model.train()
+        return {'loss': avg_loss, 'psnr': avg_psnr, 'ssim': avg_ssim}
+
+    @torch.no_grad()
+    def final_validate(self, dataloader, use_full_volumes=True, max_samples=None):
+        """
+        Final comprehensive validation at end of training
+        No sample limit - validates on ALL validation data
+        """
+        self.model.eval()
+
+        val_losses = []
+        psnr_sum = 0.0
+        ssim_sum = 0.0
+        val_count = 0
+
+        mode_str = "Full-Volume" if use_full_volumes else "Patch"
+        print(f"\n[FINAL] Validation Mode: {mode_str}")
+        print(f"[FINAL] Processing ALL validation samples (no limit)...\n")
+
+        pbar = tqdm(dataloader, desc=f"[FINAL] {mode_str} Validation")
+
+        for batch in pbar:
+            # No max_samples limit for final validation!
+            v_in = batch['input'].to(self.device, non_blocking=True)
+            v_gt = batch['target'].to(self.device, non_blocking=True)
+
+            # Compute loss
+            if self.use_amp:
+                with autocast(dtype=self.amp_dtype):
+                    loss, _ = self.model(v_in, v_gt)
+            else:
+                loss, _ = self.model(v_in, v_gt)
+
+            val_losses.append(loss.detach())
+
+            # Generate predictions and compute metrics
+            try:
+                target_depth = v_gt.shape[2]
+
+                # CRITICAL: Always generate in FP32 for numerical stability
+                with torch.cuda.amp.autocast(enabled=False):
+                    v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
+
+                # Compute metrics
+                v_pred_clamped = torch.clamp(v_pred, -1, 1)
+                v_gt_clamped = torch.clamp(v_gt, -1, 1)
+                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+
+                psnr_sum += video_metrics['psnr']
+                ssim_sum += video_metrics['ssim']
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Final validation generation failed: {e}")
+                psnr_sum += 0.0
+                ssim_sum += 0.0
+
+            val_count += 1
+            pbar.set_postfix({
+                'psnr': f'{psnr_sum/val_count:.2f}',
+                'ssim': f'{ssim_sum/val_count:.4f}'
+            })
+
+        # Calculate averages (single GPU-CPU sync at end)
+        avg_loss = torch.stack(val_losses).mean().item() if len(val_losses) > 0 else 0.0
+        avg_psnr = psnr_sum / val_count if val_count > 0 else 0.0
+        avg_ssim = ssim_sum / val_count if val_count > 0 else 0.0
+
+        print(f"\n{'='*80}")
+        print(f"[FINAL] Validation Results ({val_count} samples):")
+        print(f"  Loss: {avg_loss:.4f}")
+        print(f"  PSNR: {avg_psnr:.2f} dB")
+        print(f"  SSIM: {avg_ssim:.4f}")
+        print(f"{'='*80}\n")
+
+        # Log to TensorBoard
+        self.writer.add_scalar('val/final_loss', avg_loss, self.current_epoch)
+        self.writer.add_scalar('val/final_psnr', avg_psnr, self.current_epoch)
+        self.writer.add_scalar('val/final_ssim', avg_ssim, self.current_epoch)
+
+        # Clean up
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.model.train()
+        return {'loss': avg_loss, 'psnr': avg_psnr, 'ssim': avg_ssim}
 
     def train(self):
         """Main training loop with two-phase training support"""
@@ -409,38 +731,42 @@ class Trainer:
 
             print(f"Epoch {epoch} - Average loss: {avg_loss:.4f}")
 
-            # Save best checkpoint if this epoch has lowest loss
-            if avg_loss < self.best_loss:
-                self.best_loss = avg_loss
+            # Multi-tier validation strategy
+            # Tier 1: Loss-only validation (every epoch, fast)
+            if self.val_dataloader:
+                self.validate_loss_only()
 
-                # Delete previous best checkpoint to save space
-                if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
-                    os.remove(self.best_checkpoint_path)
-                    print(f"  Deleted previous best checkpoint")
+            # Tier 2: Patch-based validation with generation (periodic, checkpoints based on this)
+            if self.val_dataloader and (epoch + 1) % self.patch_val_interval == 0:
+                patch_val_metrics = self.validate_patches(
+                    max_samples=self.patch_val_samples,
+                    generate=self.patch_val_generate
+                )
+                # Update best checkpoint based on patch validation
+                if patch_val_metrics and 'loss' in patch_val_metrics:
+                    patch_val_loss = patch_val_metrics['loss']
+                    if patch_val_loss < self.best_loss:
+                        self.best_loss = patch_val_loss
+                        # Delete previous best checkpoint
+                        if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
+                            os.remove(self.best_checkpoint_path)
+                            print(f"  Deleted previous best checkpoint")
 
-                # Save new best checkpoint
-                best_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_best_epoch_{epoch}.pt')
-                self.best_checkpoint_path = self.checkpoint_dir / best_checkpoint_filename
-                self.save_checkpoint(best_checkpoint_filename)
-                print(f"  ✅ New best checkpoint saved: {best_checkpoint_filename} (Loss: {avg_loss:.4f})")
+                        # Save new best checkpoint
+                        best_checkpoint_filename = self._get_checkpoint_filename(f'checkpoint_best_epoch_{epoch}.pt')
+                        self.best_checkpoint_path = self.checkpoint_dir / best_checkpoint_filename
+                        self.save_checkpoint(best_checkpoint_filename)
+                        print(f"  ✅ New best checkpoint saved: {best_checkpoint_filename} (Patch Val Loss: {patch_val_loss:.4f})")
 
-            # Also save latest checkpoint (for resuming if training crashes)
-            latest_checkpoint_filename = self._get_checkpoint_filename('checkpoint_latest.pt')
-            latest_checkpoint_path = self.checkpoint_dir / latest_checkpoint_filename
-            if os.path.exists(latest_checkpoint_path):
-                os.remove(latest_checkpoint_path)
-            self.save_checkpoint(latest_checkpoint_filename)
+            # Tier 3: Full-volume validation (rare, expensive)
+            if self.full_val_dataloader and (epoch + 1) % self.full_val_interval == 0:
+                self.validate_full_volumes(max_samples=self.full_val_samples)
 
         # Training complete
         elapsed_time = time.time() - start_time
         print(f"\nTraining complete! Total time: {elapsed_time / 3600:.2f} hours")
 
-        # Run final validation to get end-of-training metrics
-        if self.val_dataloader:
-            print("\nRunning final validation...")
-            final_val_loss = self.validate()
-            self.writer.add_scalar('val/final_loss', final_val_loss, self.global_step)
-            print(f"Final validation loss: {final_val_loss:.4f}")
+        # Note: Final validation is now handled in train.py after this method returns
 
         # Save final checkpoint
         final_checkpoint_filename = self._get_checkpoint_filename('checkpoint_final.pt')
@@ -469,90 +795,69 @@ class Trainer:
         gc.collect()
 
     def load_checkpoint(self, path):
-        """Load model checkpoint and resume training"""
+        """
+        Load model checkpoint and resume training.
+
+        Follows PyTorch best practices:
+        1. Load checkpoint dict
+        2. Load state dict into EXISTING model (no duplication)
+        3. Load optimizer/scheduler/scaler states
+        4. Restore training state
+
+        This avoids creating a new model instance (which caused 2× memory usage).
+        """
         print(f"Loading checkpoint from {path}...")
 
-        # Load checkpoint and get the loaded model
-        loaded_model, checkpoint = self.model.load_checkpoint(path, self.device)
+        # Load checkpoint dict
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        # Replace the trainer's model with the loaded model
-        self.model = loaded_model
-        print(f"✓ Model weights loaded successfully")
-
-        # CRITICAL: Update optimizer param_groups to reference NEW model parameters
-        # The old optimizer was created with the old model before load!
-        # We need to rebuild param_groups with the new model's parameters
-        self.optimizer.param_groups.clear()
-
-        # Rebuild param_groups based on training config
-        base_lr = self.config.get('learning_rate', 1e-4)
-        weight_decay = self.config.get('weight_decay', 0.01)
-
-        # Get learning rate multipliers from config
-        unet_mult = self.config.get('unet_lr_mult', 1.0)
-        vae_encoder_mult = self.config.get('vae_encoder_lr_mult', 0.1)
-        vae_decoder_mult = self.config.get('vae_decoder_lr_mult', 0.1)
-
-        # VAE encoder parameters (if trainable)
-        # Handle different VAE architectures
-        vae_encoder_params = []
-        vae_decoder_params = []
-
-        if hasattr(self.model.vae, 'use_custom_maisi') and self.model.vae.use_custom_maisi:
-            # Custom MAISI VAE: encoder/decoder under maisi_vae
-            if hasattr(self.model.vae.maisi_vae, 'encoder'):
-                vae_encoder_params = [p for p in self.model.vae.maisi_vae.encoder.parameters() if p.requires_grad]
-            if hasattr(self.model.vae.maisi_vae, 'decoder'):
-                vae_decoder_params = [p for p in self.model.vae.maisi_vae.decoder.parameters() if p.requires_grad]
-        elif hasattr(self.model.vae, 'use_maisi') and self.model.vae.use_maisi:
-            # MONAI MAISI VAE: no separate encoder/decoder access
-            # Skip adding separate param groups for encoder/decoder
-            pass
-        else:
-            # Standard VAE or MAISI-arch: encoder/decoder directly accessible
-            if hasattr(self.model.vae, 'encoder'):
-                vae_encoder_params = [p for p in self.model.vae.encoder.parameters() if p.requires_grad]
-            if hasattr(self.model.vae, 'decoder'):
-                vae_decoder_params = [p for p in self.model.vae.decoder.parameters() if p.requires_grad]
-
-        if vae_encoder_params:
-            self.optimizer.add_param_group({
-                'params': vae_encoder_params,
-                'lr': base_lr * vae_encoder_mult,
-                'name': 'vae_encoder'
-            })
-
-        # VAE decoder parameters (if trainable)
-        if vae_decoder_params:
-            self.optimizer.add_param_group({
-                'params': vae_decoder_params,
-                'lr': base_lr * vae_decoder_mult,
-                'name': 'vae_decoder'
-            })
-
-        # U-Net parameters (should always be trainable)
-        unet_params = [p for p in self.model.unet.parameters() if p.requires_grad]
-        if unet_params:
-            self.optimizer.add_param_group({
-                'params': unet_params,
-                'lr': base_lr * unet_mult,
-                'name': 'unet'
-            })
+        # Load model state dict into EXISTING model (standard PyTorch pattern)
+        # This avoids creating a duplicate model in memory
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+            print(f"✓ Model weights loaded successfully")
+        except RuntimeError as e:
+            print(f"⚠ WARNING: Model state dict mismatch: {e}")
+            print(f"  Attempting non-strict loading...")
+            missing_keys, unexpected_keys = self.model.load_state_dict(
+                checkpoint['model_state_dict'], strict=False
+            )
+            if missing_keys:
+                print(f"  Missing keys: {missing_keys[:5]}...")  # Show first 5
+            if unexpected_keys:
+                print(f"  Unexpected keys: {unexpected_keys[:5]}...")
+            print(f"✓ Model weights loaded (non-strict)")
 
         # Restore optimizer state
+        # The optimizer already has correct param_groups from train.py initialization
+        # We just need to restore the state (momentum buffers, etc.)
         if 'optimizer_state_dict' in checkpoint:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"✓ Optimizer state restored")
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"✓ Optimizer state restored")
+            except (ValueError, KeyError) as e:
+                print(f"⚠ WARNING: Optimizer state mismatch: {e}")
+                print(f"  This can happen if model architecture changed or VAE was frozen/unfrozen")
+                print(f"  Skipping optimizer state - will use fresh optimizer with current LRs")
+                print(f"  Training will continue normally!")
 
         # Restore scheduler state
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print(f"✓ Scheduler state restored")
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"✓ Scheduler state restored")
+            except (ValueError, KeyError) as e:
+                print(f"⚠ WARNING: Scheduler state mismatch: {e}")
+                print(f"  Skipping scheduler state - will use fresh scheduler")
 
         # Restore GradScaler state (CRITICAL for mixed precision training!)
         if 'scaler_state_dict' in checkpoint and self.scaler is not None:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            print(f"✓ GradScaler state restored (scale={self.scaler.get_scale():.0f})")
+            try:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                print(f"✓ GradScaler state restored (scale={self.scaler.get_scale():.0f})")
+            except (ValueError, RuntimeError) as e:
+                print(f"⚠ WARNING: GradScaler state mismatch: {e}")
+                print(f"  Skipping GradScaler state - will use fresh scaler")
 
         # Restore training state
         if 'epoch' in checkpoint:
@@ -586,10 +891,13 @@ class Trainer:
 
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 
-        # DEFENSIVE: Explicitly clear any stale gradients from loaded optimizer state
-        # This ensures clean slate even if optimizer state contained accumulated gradients
+        # Clear any stale gradients
         self.optimizer.zero_grad(set_to_none=True)
         print(f"✓ Gradients cleared after checkpoint load")
+
+        # Set flag to clear CUDA cache at start of next epoch
+        # This prevents checkpoint loading artifacts from consuming memory
+        self.just_resumed_checkpoint = True
 
 
 if __name__ == "__main__":

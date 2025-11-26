@@ -36,11 +36,11 @@ spec:
 
         resources:
           requests:
-            memory: "32Gi"  # Increased for A100 80GB with 24 frames
+            memory: "16Gi"  # Increased for A100 80GB with 24 frames
             cpu: "4"
             nvidia.com/a100: "1"
           limits:
-            memory: "32Gi"  # A100 80GB GPU
+            memory: "16Gi"  # A100 80GB GPU
             cpu: "4"
             nvidia.com/a100: "1"
 
@@ -66,11 +66,11 @@ spec:
       volumes:
       - name: storage
         persistentVolumeClaim:
-          claimName: v2v-diffuser-kuntal-a100  # A100 storage
+          claimName: v2v-diffuser-kuntal-a100-shared  # A100 storage
       - name: dshm
         emptyDir:
           medium: Memory
-          sizeLimit: "16Gi"  # Increased shared memory for larger GPU
+          sizeLimit: "8Gi"  # Increased shared memory for larger GPU
 
       # Tolerations for A100 GPU nodes
       tolerations:

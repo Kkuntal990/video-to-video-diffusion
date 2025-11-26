@@ -1,0 +1,166 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vae-preprocessing-job-a100
+spec:
+  template:
+    metadata:
+      labels:
+        app: v2v-diffusion
+        type: vae-preprocessing
+        gpu: none
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: vae-preprocessing
+        image: ghcr.io/kkuntal990/v2v-diffusion:latest
+        imagePullPolicy: Always
+
+        # Preprocessing-only command
+        command: ["/bin/bash"]
+        args:
+        - "-c"
+        - |
+          echo "=========================================="
+          echo "VAE Preprocessing Job (Full Reprocess)"
+          echo "=========================================="
+          echo "Node: $(hostname)"
+          echo ""
+
+          # Display storage status
+          echo "Storage status:"
+          df -h /workspace/storage_a100
+          echo ""
+
+          # Check dataset availability
+          echo "Dataset directory:"
+          ls -lh /workspace/storage_a100/dataset/
+          echo ""
+
+          # STEP 1: Clean existing cache (force full reprocess)
+          echo "=========================================="
+          echo "STEP 1: Cleaning existing cache..."
+          echo "=========================================="
+          PROCESSED_DIR="/workspace/storage_a100/.cache/processed"
+          EXTRACT_DIR="/workspace/storage_a100/.cache/slice_interpolation_cache"
+
+          if [ -d "$PROCESSED_DIR" ]; then
+            echo "Removing existing processed cache..."
+            du -sh "$PROCESSED_DIR" 2>/dev/null || echo "Cache doesn't exist yet"
+            rm -rf "$PROCESSED_DIR"
+            echo "✓ Processed cache cleared: $PROCESSED_DIR"
+          else
+            echo "No existing processed cache found at $PROCESSED_DIR"
+          fi
+
+          if [ -d "$EXTRACT_DIR/extracted" ]; then
+            echo "Removing extraction cache..."
+            rm -rf "$EXTRACT_DIR/extracted"
+            echo "✓ Extraction cache cleared"
+          fi
+
+          echo ""
+
+          # STEP 2: Run preprocessing via VAE training script (num_epochs=0)
+          echo "=========================================="
+          echo "STEP 2: Running preprocessing..."
+          echo "=========================================="
+          echo "This will process all 356 valid patients"
+          echo "Expected time: ~30-60 minutes"
+          echo ""
+
+          # Set num_epochs to 0 in config to exit after preprocessing
+          sed -i 's/num_epochs: 20/num_epochs: 0/' /workspace/config/vae_training.yaml
+
+          # Run training script (will preprocess then exit)
+          python /workspace/train_vae.py \
+            --config /workspace/config/vae_training.yaml \
+            2>&1 | tee /workspace/storage_a100/logs/preprocessing_$(date +%Y%m%d_%H%M%S).log
+
+          # Restore original config
+          sed -i 's/num_epochs: 0/num_epochs: 20/' /workspace/config/vae_training.yaml
+
+          echo ""
+          echo "=========================================="
+          echo "STEP 3: Verification"
+          echo "=========================================="
+
+          # Count processed files
+          PROCESSED_COUNT=$(ls -1 "$PROCESSED_DIR/"*.pt 2>/dev/null | wc -l)
+          echo "Preprocessed files created: $PROCESSED_COUNT"
+          echo "Expected: ~437 files (456 total - 19 corrupted)"
+          echo ""
+
+          # Show file range
+          echo "First 10 files:"
+          ls "$PROCESSED_DIR/" | sort | head -10
+          echo ""
+          echo "Last 10 files:"
+          ls "$PROCESSED_DIR/" | sort | tail -10
+          echo ""
+
+          # Check for case number range (simplified - no Python)
+          echo "Checking case number range..."
+          FIRST_CASE=$(ls "$PROCESSED_DIR/" 2>/dev/null | sort | head -1 | sed 's/case_//;s/.pt//')
+          LAST_CASE=$(ls "$PROCESSED_DIR/" 2>/dev/null | sort | tail -1 | sed 's/case_//;s/.pt//')
+          if [ -n "$FIRST_CASE" ]; then
+            echo "Case range: $FIRST_CASE to $LAST_CASE"
+          fi
+
+          echo ""
+
+          # Check cache size
+          if [ -d "$PROCESSED_DIR" ]; then
+            echo "Cache size:"
+            du -sh "$PROCESSED_DIR"
+            echo "Expected: ~120-140 GB for ~437 patients"
+          fi
+
+          echo ""
+
+          # Check for failures
+          FAILURES_FILE="/workspace/storage_a100/.cache/preprocessing_failures.txt"
+          if [ -f "$FAILURES_FILE" ]; then
+            echo "Preprocessing failures report:"
+            cat "$FAILURES_FILE"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Preprocessing completed!"
+          echo "=========================================="
+
+          # Exit status
+          if [ "$PROCESSED_COUNT" -ge 350 ]; then
+            echo "✓ SUCCESS: Sufficient files preprocessed"
+            exit 0
+          else
+            echo "✗ WARNING: Expected ~356 files, got $PROCESSED_COUNT"
+            exit 1
+          fi
+
+        resources:
+          requests:
+            memory: "32Gi"  # More memory for preprocessing
+            cpu: "16"       # More CPU cores for parallel DICOM reading
+          limits:
+            memory: "32Gi"
+            cpu: "16"
+
+        volumeMounts:
+        - name: storage
+          mountPath: /workspace/storage_a100
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TORCH_HOME
+          value: "/workspace/storage_a100/.cache/torch"
+        - name: HF_HOME
+          value: "/workspace/storage_a100/.cache/huggingface"
+
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal-a100  # NOT -shared

@@ -51,14 +51,36 @@ def calculate_ssim(img1, img2, window_size=11, max_val=1.0):
     Simplified version - for full implementation, use pytorch-msssim library
 
     Args:
-        img1: first image/video tensor (B, C, H, W)
-        img2: second image/video tensor (B, C, H, W)
+        img1: first image/video tensor (B, C, H, W) or (B, C, D, H, W)
+        img2: second image/video tensor (B, C, H, W) or (B, C, D, H, W)
         window_size: size of Gaussian window
         max_val: maximum pixel value
 
     Returns:
         ssim: SSIM value in [0, 1]
+
+    Note:
+        For 5D tensors (3D volumes), SSIM is computed across all slices and averaged
     """
+    # Handle 5D tensors (3D volumes) by computing SSIM per slice and averaging
+    if img1.ndim == 5:  # (B, C, D, H, W)
+        B, C, D, H, W = img1.shape
+        ssim_values = []
+
+        # Compute SSIM for each slice
+        for d in range(D):
+            slice1 = img1[:, :, d, :, :]  # (B, C, H, W)
+            slice2 = img2[:, :, d, :, :]
+
+            # Compute SSIM for this slice (recursive call with 4D input)
+            ssim_d = calculate_ssim(slice1, slice2, window_size, max_val)
+            ssim_values.append(ssim_d)
+
+        # Return average SSIM across all slices
+        return sum(ssim_values) / len(ssim_values) if ssim_values else 0.0
+
+    # For 4D tensors, compute SSIM normally (below)
+
     # FIXED: Add numerical stability constants
     C1 = (0.01 * max_val) ** 2
     C2 = (0.03 * max_val) ** 2

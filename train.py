@@ -16,6 +16,7 @@ logging.getLogger('pydicom').setLevel(logging.ERROR)
 import torch
 import argparse
 import yaml
+import os
 from pathlib import Path
 import random
 import numpy as np
@@ -66,68 +67,93 @@ def main(args):
     logger.info("Creating model...")
     model = VideoToVideoDiffusion(config)
 
-    # Count parameters
+    # Load pretrained VAE weights if configured
+    if config.get('pretrained', {}).get('use_pretrained', False):
+        vae_config = config['pretrained'].get('vae', {})
+        if vae_config.get('enabled', False):
+            checkpoint_path = vae_config.get('checkpoint_path', None)
+
+            # Check if loading from local checkpoint file (custom trained VAE)
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                logger.info(f"Loading custom trained VAE from local checkpoint: {checkpoint_path}")
+
+                try:
+                    # Load checkpoint
+                    vae_checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+                    # Handle different checkpoint formats
+                    if 'model_state_dict' in vae_checkpoint:
+                        vae_state_dict = vae_checkpoint['model_state_dict']
+                    elif 'vae_state_dict' in vae_checkpoint:
+                        vae_state_dict = vae_checkpoint['vae_state_dict']
+                    elif 'state_dict' in vae_checkpoint:
+                        vae_state_dict = vae_checkpoint['state_dict']
+                    else:
+                        # Assume checkpoint is a direct state dict
+                        vae_state_dict = vae_checkpoint
+
+                    # Load weights into model's VAE
+                    missing_keys, unexpected_keys = model.vae.load_state_dict(vae_state_dict, strict=False)
+
+                    logger.info(f"✓ Loaded custom VAE checkpoint: {len(vae_state_dict)} keys")
+                    if len(missing_keys) > 0:
+                        logger.warning(f"  Missing keys: {len(missing_keys)}")
+                    if len(unexpected_keys) > 0:
+                        logger.warning(f"  Unexpected keys: {len(unexpected_keys)}")
+
+                except Exception as e:
+                    logger.error(f"Failed to load VAE checkpoint: {e}")
+                    logger.info("Continuing with randomly initialized VAE")
+            else:
+                logger.warning("No checkpoint_path specified for VAE, using random initialization")
+
+        # Freeze VAE parameters (more efficient than lr=0.0)
+        # This saves memory (no gradient storage) and speeds up training
+        for param in model.vae.parameters():
+            param.requires_grad = False
+        logger.info("✓ Froze all VAE parameters (requires_grad=False)")
+
+    # Count parameters AFTER freezing VAE to show correct trainable counts
     param_counts = model.count_parameters()
     logger.info(f"Total parameters: {param_counts['total']:,}")
     logger.info(f"  Trainable: {param_counts['trainable']:,}")
     logger.info(f"  VAE: {param_counts['vae']:,} ({param_counts['vae_trainable']:,} trainable)")
     logger.info(f"  U-Net: {param_counts['unet']:,}")
 
-    # Load pretrained VAE weights if configured
-    if config.get('pretrained', {}).get('use_pretrained', False):
-        from utils.pretrained import (
-            load_pretrained_opensora_vae,
-            load_pretrained_cogvideox_vae,
-            load_pretrained_sd_vae,
-            map_sd_vae_to_video_vae
-        )
+    # Note: Model will be moved to device in Trainer.__init__ for better encapsulation
 
-        vae_config = config['pretrained'].get('vae', {})
-        # Skip if using custom MAISI VAE (weights already loaded in model constructor)
-        if vae_config.get('enabled', False) and not vae_config.get('use_custom_maisi', False):
-            model_name = vae_config.get('model_name', 'hpcai-tech/OpenSora-VAE-v1.2')
-            inflate_method = vae_config.get('inflate_method', 'central')
-
-            logger.info(f"Loading pretrained VAE from {model_name}...")
-
-            try:
-                # Determine which loader to use
-                if 'OpenSora' in model_name or 'opensora' in model_name.lower():
-                    vae_state_dict = load_pretrained_opensora_vae(model_name)
-                elif 'CogVideo' in model_name:
-                    vae_state_dict = load_pretrained_cogvideox_vae(model_name)
-                elif 'stable' in model_name.lower() or 'sd-' in model_name:
-                    vae_state_dict = load_pretrained_sd_vae(model_name)
-                    # Inflate 2D->3D for Stable Diffusion VAE
-                    vae_state_dict = map_sd_vae_to_video_vae(vae_state_dict, inflate_method)
-                else:
-                    logger.warning(f"Unknown VAE model: {model_name}, skipping pretrained loading")
-                    vae_state_dict = None
-
-                if vae_state_dict is not None:
-                    # Load weights into model's VAE
-                    missing_keys, unexpected_keys = model.vae.load_state_dict(vae_state_dict, strict=False)
-
-                    if len(missing_keys) > 0:
-                        logger.warning(f"Missing keys in VAE: {len(missing_keys)} keys")
-                    if len(unexpected_keys) > 0:
-                        logger.warning(f"Unexpected keys in VAE: {len(unexpected_keys)} keys")
-
-                    logger.info("✓ Successfully loaded pretrained VAE weights")
-
-            except Exception as e:
-                logger.error(f"Failed to load pretrained VAE: {e}")
-                logger.info("Continuing with randomly initialized VAE")
-
-    model = model.to(device)
-
-    # Create dataloaders
+    # Create dataloaders for multi-tier validation strategy
     logger.info("Creating dataloaders...")
+    use_patches = config['data'].get('use_patches', False)
+
+    # Training dataloader (uses config as-is)
+    if use_patches:
+        logger.info("Using PATCH-BASED training mode")
+        logger.info(f"  Patch size: {config['data'].get('patch_depth_thin', 48)} thin × {config['data'].get('patch_depth_thick', 8)} thick @ {config['data'].get('patch_size', [192, 192])}")
+    else:
+        logger.info("Using FULL-VOLUME training mode")
+
     train_dataloader = get_dataloader(config['data'], split='train')
 
-    # Create validation dataloader (15% of data, stratified by category)
-    logger.info("Creating validation dataloader...")
-    val_dataloader = get_dataloader(config['data'], split='val')
+    # Patch validation dataloader (Tier 1 & 2: loss-only and patch-based validation)
+    logger.info("Creating patch validation dataloader...")
+    patch_val_config = config['data'].copy()
+    patch_val_config['use_patches'] = True  # Always use patches for Tier 1 & 2
+    patch_val_config['batch_size'] = config['data'].get('batch_size', 8)
+    patch_val_dataloader = get_dataloader(patch_val_config, split='val')
+
+    # Full-volume validation dataloader (Tier 3: full-volume validation)
+    # Only create if full validation is enabled (interval < 1000)
+    full_val_interval = config['training'].get('full_val_interval', 999999)
+    if full_val_interval < 1000:
+        logger.info("Creating full-volume validation dataloader...")
+        full_val_config = config['data'].copy()
+        full_val_config['use_patches'] = False  # Full volumes for Tier 3
+        full_val_config['batch_size'] = 1  # Must use small batch for full volumes
+        full_val_dataloader = get_dataloader(full_val_config, split='val')
+    else:
+        logger.info(f"Full-volume validation disabled (interval={full_val_interval}), skipping dataloader creation")
+        full_val_dataloader = None
 
     # Note: Streaming datasets don't support len()
     try:
@@ -149,42 +175,23 @@ def main(args):
     vae_decoder_mult = lr_multipliers.get('vae_decoder', 1.0)
     unet_mult = lr_multipliers.get('unet', 1.0)
 
-    # VAE encoder/decoder parameters - handle custom MAISI VAE structure
+    # VAE encoder/decoder parameters
     # CRITICAL: Only include parameters with requires_grad=True to avoid GradScaler errors
-    if hasattr(model.vae, 'maisi_vae') and model.vae.maisi_vae is not None:
-        # Custom MAISI VAE: encoder/decoder are nested in maisi_vae
-        vae_encoder_params = [p for p in model.vae.maisi_vae.encoder.parameters() if p.requires_grad]
-        if vae_encoder_params:
-            param_groups.append({
-                'params': vae_encoder_params,
-                'lr': base_lr * vae_encoder_mult,
-                'name': 'vae_encoder'
-            })
+    vae_encoder_params = [p for p in model.vae.encoder.parameters() if p.requires_grad]
+    if vae_encoder_params:
+        param_groups.append({
+            'params': vae_encoder_params,
+            'lr': base_lr * vae_encoder_mult,
+            'name': 'vae_encoder'
+        })
 
-        vae_decoder_params = [p for p in model.vae.maisi_vae.decoder.parameters() if p.requires_grad]
-        if vae_decoder_params:
-            param_groups.append({
-                'params': vae_decoder_params,
-                'lr': base_lr * vae_decoder_mult,
-                'name': 'vae_decoder'
-            })
-    else:
-        # Regular VAE: encoder/decoder are direct attributes
-        vae_encoder_params = [p for p in model.vae.encoder.parameters() if p.requires_grad]
-        if vae_encoder_params:
-            param_groups.append({
-                'params': vae_encoder_params,
-                'lr': base_lr * vae_encoder_mult,
-                'name': 'vae_encoder'
-            })
-
-        vae_decoder_params = [p for p in model.vae.decoder.parameters() if p.requires_grad]
-        if vae_decoder_params:
-            param_groups.append({
-                'params': vae_decoder_params,
-                'lr': base_lr * vae_decoder_mult,
-                'name': 'vae_decoder'
-            })
+    vae_decoder_params = [p for p in model.vae.decoder.parameters() if p.requires_grad]
+    if vae_decoder_params:
+        param_groups.append({
+            'params': vae_decoder_params,
+            'lr': base_lr * vae_decoder_mult,
+            'name': 'vae_decoder'
+        })
 
     # U-Net parameters - filter to trainable only for consistency
     unet_params = [p for p in model.unet.parameters() if p.requires_grad]
@@ -227,7 +234,8 @@ def main(args):
         optimizer=optimizer,
         scheduler=scheduler,
         train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
+        val_dataloader=patch_val_dataloader,  # Patch-based validation (Tier 1 & 2)
+        full_val_dataloader=full_val_dataloader,  # Full-volume validation (Tier 3)
         config=config['training'],
         device=device,
         log_dir=str(log_dir),
@@ -266,6 +274,21 @@ def main(args):
     # Start training
     logger.info("Starting training...")
     trainer.train()
+
+    # Final comprehensive validation on all validation samples
+    if config['training'].get('final_val_enabled', True):
+        logger.info("=" * 80)
+        logger.info("Running FINAL validation on all validation samples...")
+        logger.info("=" * 80)
+
+        use_full_volumes = config['training'].get('final_val_full_volumes', True)
+        final_dataloader = full_val_dataloader if use_full_volumes else patch_val_dataloader
+
+        trainer.final_validate(
+            dataloader=final_dataloader,
+            use_full_volumes=use_full_volumes,
+            max_samples=None  # No limit - use ALL validation data
+        )
 
     logger.info("Training complete!")
 
