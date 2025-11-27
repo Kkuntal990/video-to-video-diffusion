@@ -177,9 +177,10 @@ class VideoToVideoDiffusion(nn.Module):
             loss: training loss (scalar)
             metrics: dict with additional metrics
         """
-        # Encode videos to latent space
-        z_in = self.vae.encode(v_in)  # Conditioning latent
-        z_gt = self.vae.encode(v_gt)  # Target latent for diffusion
+        # Encode videos to latent space (VAE is frozen during diffusion training)
+        with torch.no_grad():
+            z_in = self.vae.encode(v_in)  # Conditioning latent
+            z_gt = self.vae.encode(v_gt)  # Target latent for diffusion
 
         # Handle depth mismatch (full-volume mode) or same-depth (patch-based mode)
         if z_in.shape[2] != z_gt.shape[2]:
@@ -276,8 +277,8 @@ class VideoToVideoDiffusion(nn.Module):
             # Determine target latent shape
             if target_depth is not None:
                 # For slice interpolation: need to determine latent depth from target depth
-                # VAE compresses depth by 4×: D_latent = D / 4
-                latent_depth_target = target_depth // 4
+                # Custom VAE does NOT compress depth (only spatial 8×)
+                latent_depth_target = target_depth
 
                 # Upsample z_in to target latent depth
                 z_in_upsampled = F.interpolate(

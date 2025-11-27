@@ -361,11 +361,14 @@ class Trainer:
                         v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
 
                     # Calculate SSIM and PSNR metrics
+                    # Normalize to [0, 1] range to match VAE training metrics
                     v_pred_clamped = torch.clamp(v_pred, -1, 1)
                     v_gt_clamped = torch.clamp(v_gt, -1, 1)
+                    v_pred_norm = (v_pred_clamped + 1.0) / 2.0  # [-1, 1] → [0, 1]
+                    v_gt_norm = (v_gt_clamped + 1.0) / 2.0      # [-1, 1] → [0, 1]
 
-                    # PSNR max_val should be range size: 2.0 for [-1, 1]
-                    video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+                    # Use max_val=1.0 for [0, 1] range (consistent with VAE training)
+                    video_metrics = calculate_video_metrics(v_pred_norm, v_gt_norm, max_val=1.0)
                     psnr_sum += video_metrics['psnr']
                     ssim_sum += video_metrics['ssim']
                 else:
@@ -484,9 +487,12 @@ class Trainer:
                         v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
 
                     # Compute metrics on patches
+                    # Normalize to [0, 1] range to match VAE training metrics
                     v_pred_clamped = torch.clamp(v_pred, -1, 1)
                     v_gt_clamped = torch.clamp(v_gt, -1, 1)
-                    video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+                    v_pred_norm = (v_pred_clamped + 1.0) / 2.0  # [-1, 1] → [0, 1]
+                    v_gt_norm = (v_gt_clamped + 1.0) / 2.0      # [-1, 1] → [0, 1]
+                    video_metrics = calculate_video_metrics(v_pred_norm, v_gt_norm, max_val=1.0)
 
                     psnr_sum += video_metrics['psnr']
                     ssim_sum += video_metrics['ssim']
@@ -559,9 +565,12 @@ class Trainer:
                     v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
 
                 # Compute metrics on full volumes
+                # Normalize to [0, 1] range to match VAE training metrics
                 v_pred_clamped = torch.clamp(v_pred, -1, 1)
                 v_gt_clamped = torch.clamp(v_gt, -1, 1)
-                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+                v_pred_norm = (v_pred_clamped + 1.0) / 2.0  # [-1, 1] → [0, 1]
+                v_gt_norm = (v_gt_clamped + 1.0) / 2.0      # [-1, 1] → [0, 1]
+                video_metrics = calculate_video_metrics(v_pred_norm, v_gt_norm, max_val=1.0)
 
                 psnr_sum += video_metrics['psnr']
                 ssim_sum += video_metrics['ssim']
@@ -635,9 +644,12 @@ class Trainer:
                     v_pred = self.model.generate(v_in, sampler='ddim', num_inference_steps=20, target_depth=target_depth)
 
                 # Compute metrics
+                # Normalize to [0, 1] range to match VAE training metrics
                 v_pred_clamped = torch.clamp(v_pred, -1, 1)
                 v_gt_clamped = torch.clamp(v_gt, -1, 1)
-                video_metrics = calculate_video_metrics(v_pred_clamped, v_gt_clamped, max_val=2.0)
+                v_pred_norm = (v_pred_clamped + 1.0) / 2.0  # [-1, 1] → [0, 1]
+                v_gt_norm = (v_gt_clamped + 1.0) / 2.0      # [-1, 1] → [0, 1]
+                video_metrics = calculate_video_metrics(v_pred_norm, v_gt_norm, max_val=1.0)
 
                 psnr_sum += video_metrics['psnr']
                 ssim_sum += video_metrics['ssim']

@@ -1,0 +1,154 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vae-reconstruction-evaluation
+spec:
+  ttlSecondsAfterFinished: 3600  # Keep job for 1 hour after completion
+  template:
+    metadata:
+      labels:
+        app: vae-reconstruction-eval
+        type: inference-job
+        gpu: a100
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: vae-eval
+        image: ghcr.io/kkuntal990/v2v-diffusion:latest
+        imagePullPolicy: Always
+        command: ["/bin/bash"]
+        args:
+        - "-c"
+        - |
+          echo "=========================================="
+          echo "VAE Reconstruction Quality Evaluation"
+          echo "=========================================="
+          echo "GPU Info:"
+          nvidia-smi
+          echo ""
+          echo "Node: $(hostname)"
+          echo ""
+
+          # Find VAE checkpoint automatically (with suffix support)
+          SUFFIX=$(python3 -c "import yaml; c=yaml.safe_load(open('config/vae_training.yaml')); print(c['training'].get('model_suffix', ''))")
+
+          if [ -n "$SUFFIX" ]; then
+            CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/vae_training_${SUFFIX}"
+          else
+            CHECKPOINT_DIR="/workspace/storage_a100/checkpoints/vae_training"
+          fi
+
+          VAE_CHECKPOINT="${CHECKPOINT_DIR}/vae_best.pt"
+
+          if [ ! -f "$VAE_CHECKPOINT" ]; then
+            echo "ERROR: No VAE checkpoint found at ${VAE_CHECKPOINT}"
+            echo "Available files:"
+            ls -lh ${CHECKPOINT_DIR}/ 2>/dev/null || echo "Directory does not exist"
+            exit 1
+          fi
+
+          echo "Using VAE checkpoint: ${VAE_CHECKPOINT}"
+          echo ""
+
+          # Evaluate thin slices (high-resolution reconstruction)
+          echo "=========================================="
+          echo "Evaluating Thin Slices (48 slices)"
+          echo "=========================================="
+          python scripts/evaluate_vae_reconstruction.py \
+            --checkpoint "${VAE_CHECKPOINT}" \
+            --config config/vae_training.yaml \
+            --slice-type thin \
+            --split val \
+            --num-samples 50 \
+            --batch-size 1 \
+            --output-dir /workspace/storage_a100/results/vae_evaluation/thin_slices \
+            --save-reconstructions
+
+          echo ""
+          echo "=========================================="
+          echo "Evaluating Thick Slices (8 slices)"
+          echo "=========================================="
+          python scripts/evaluate_vae_reconstruction.py \
+            --checkpoint "${VAE_CHECKPOINT}" \
+            --config config/vae_training.yaml \
+            --slice-type thick \
+            --split val \
+            --num-samples 50 \
+            --batch-size 1 \
+            --output-dir /workspace/storage_a100/results/vae_evaluation/thick_slices \
+            --save-reconstructions
+
+          echo ""
+          echo "=========================================="
+          echo "VAE Evaluation Completed!"
+          echo "=========================================="
+          echo ""
+          echo "Results saved to: /workspace/storage_a100/results/vae_evaluation/"
+          echo ""
+          echo "Thin Slices Summary:"
+          cat /workspace/storage_a100/results/vae_evaluation/thin_slices/metrics/vae_reconstruction_metrics.json | grep -A 10 '"overall"'
+          echo ""
+          echo "Thick Slices Summary:"
+          cat /workspace/storage_a100/results/vae_evaluation/thick_slices/metrics/vae_reconstruction_metrics.json | grep -A 10 '"overall"'
+
+        resources:
+          requests:
+            memory: "16Gi"
+            cpu: "4"
+            nvidia.com/a100: "1"
+          limits:
+            memory: "16Gi"
+            cpu: "4"
+            nvidia.com/a100: "1"
+
+        volumeMounts:
+        - name: storage
+          mountPath: /workspace/storage_a100
+        - name: dshm
+          mountPath: /dev/shm
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TORCH_HOME
+          value: "/workspace/storage_a100/.cache/torch"
+        - name: HF_HOME
+          value: "/workspace/storage_a100/.cache/huggingface"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        # Memory optimization
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: v2v-diffuser-kuntal-a100-shared
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "8Gi"
+
+      # Tolerations for A100 GPU nodes
+      tolerations:
+      - effect: NoSchedule
+        key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+
+      # Node affinity to ensure 80GB A100
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB

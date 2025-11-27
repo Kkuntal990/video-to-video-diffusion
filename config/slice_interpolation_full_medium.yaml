@@ -31,7 +31,7 @@ pretrained:
   # Custom Trained VAE
   vae:
     enabled: true
-    checkpoint_path: '/workspace/storage_a100/checkpoints/vae_training_custom_vae_o1/vae_best.pt'
+    checkpoint_path: '/workspace/storage_a100/checkpoints/vae_training_custom_vae_no_skips/vae_best.pt'  # NEW: No skip connections
     freeze_epochs: 0  # VAE frozen from start (trained separately)
 
   # Training strategy
@@ -83,7 +83,7 @@ data:
 
   # DataLoader settings (INCREASED for patches!)
   batch_size: 8  # Moderate batch size for custom VAE + UNet (changed from 16)
-  num_workers: 8  # Increased workers for patch sampling
+  num_workers: 4  # Increased workers for patch sampling
   pin_memory: true
   drop_last: true
   cache_extracted: false  # Not needed - preprocessing pipeline deletes DICOMs automatically

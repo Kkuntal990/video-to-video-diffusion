@@ -260,27 +260,32 @@ class VideoVAE(nn.Module):
 
     Compresses videos into latent space and reconstructs them.
     Input/Output format: (B, C, T, H, W)
+
+    IMPORTANT: For latent diffusion, skip connections are DISABLED.
+    Encoder and decoder must work independently.
     """
 
     def __init__(self, in_channels=3, latent_dim=4, base_channels=64, scaling_factor=0.18215,
-                 gradient_checkpointing=False, use_skip_connections=True):
+                 gradient_checkpointing=False, use_skip_connections=False):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.in_channels = in_channels
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_skip_connections = use_skip_connections  # Enable U-Net style skip connections
+        # FORCE skip connections to False for latent diffusion compatibility
+        self.use_skip_connections = False  # Encoder/decoder must work independently
 
-        # Use custom VideoVAE architecture
+        # Use custom VideoVAE architecture WITHOUT skip connections
         self.encoder = VideoEncoder(in_channels, latent_dim, base_channels)
-        self.decoder = VideoDecoder(latent_dim, in_channels, base_channels, use_skip_connections=use_skip_connections)
+        self.decoder = VideoDecoder(latent_dim, in_channels, base_channels, use_skip_connections=False)
 
         # Scaling factor for latent space normalization
         # Standard SD VAE uses 0.18215, but this should be calculated from your dataset
         # To calculate: scale = 1 / std(latent_activations)
         self.scaling_factor = scaling_factor
-        print(f"✓ Initialized custom VideoVAE")
-        print(f"  Skip connections: {'Enabled (U-Net style)' if use_skip_connections else 'Disabled'}")
+        print(f"✓ Initialized custom VideoVAE (latent diffusion mode)")
+        print(f"  Skip connections: DISABLED (encoder/decoder work independently)")
+        print(f"  Latent dim: {latent_dim}, Base channels: {base_channels}")
 
     def encode(self, x):
         """
@@ -338,29 +343,20 @@ class VideoVAE(nn.Module):
 
     def forward(self, x):
         """
-        Full forward pass (encode then decode) with skip connections
+        Full forward pass: encode then decode (NO skip connections)
+
+        This is the ONLY training path. Encoder and decoder work independently.
+
         Args:
-            x: (B, C, T, H, W) video tensor
+            x: (B, C, T, H, W) video tensor in range [-1, 1]
         Returns:
-            recon: (B, C, T, H, W) reconstructed video
-            z: (B, latent_dim, T, h, w) latent representation
+            recon: (B, C, T, H, W) reconstructed video in range [-1, 1]
+            z: (B, latent_dim, T, h, w) scaled latent representation
         """
-        # Use skip connections if enabled
-        if self.use_skip_connections:
-            # Encode with skip connections
-            z, skips = self.encoder(x, return_skips=True)
-            z = z * self.scaling_factor
-
-            # Decode with skip connections
-            z_unscaled = z / self.scaling_factor
-            recon = self.decoder(z_unscaled, skips=skips)
-
-            return recon, z
-        else:
-            # Standard forward pass (no skips)
-            z = self.encode(x)
-            recon = self.decode(z)
-            return recon, z
+        # Always use encode/decode path (no skips)
+        z = self.encode(x)
+        recon = self.decode(z)
+        return recon, z
 
     def get_latent_shape(self, video_shape):
         """Calculate latent shape given video shape"""
