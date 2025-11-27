@@ -1,6 +1,9 @@
 # VAE Training Configuration
 # Train a custom 3D VAE from scratch for CT slice interpolation
 # Target: PSNR >35 dB reconstruction quality
+#
+# ⚠️  IMPORTANT: Skip connections are DISABLED for latent diffusion compatibility!
+# The VAE must work with encode()/decode() independently (no cross-encoder-decoder skips).
 
 # Model Configuration - Lightweight VAE
 model:
@@ -13,6 +16,9 @@ model:
   use_pretrained: false
   use_custom_maisi: false
   use_maisi: false
+
+  # Skip connections DISABLED (hardcoded in vae.py for latent diffusion)
+  # use_skip_connections: false  # Not needed - always false now
 
 # Data Configuration - Patch-based for memory efficiency
 data:
@@ -43,8 +49,8 @@ data:
   max_train_samples: null  # Set to 2 for quick debug, null for full training
   max_val_samples: null    # Limit validation samples (optional)
 
-  # DataLoader settings (increased batch size for patches!)
-  batch_size: 1
+  # DataLoader settings (increased batch size - skip connections removed!)
+  batch_size: 1  # Increased from 1 (skip connections removed = less memory)
   num_workers: 4
   pin_memory: true
   drop_last: true
@@ -55,7 +61,7 @@ training:
   learning_rate: 0.0001  # 1e-4
   weight_decay: 0.00001
 
-  model_suffix: 'custom_vae_o1'
+  model_suffix: 'custom_vae_no_skips'  # No skip connections - for latent diffusion
 
   # Slice sampling ratio during training
   # Controls how often the VAE trains on thick vs thin slices

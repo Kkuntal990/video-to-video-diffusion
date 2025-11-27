@@ -111,7 +111,9 @@ def main(args):
         # This saves memory (no gradient storage) and speeds up training
         for param in model.vae.parameters():
             param.requires_grad = False
+        model.vae.eval()  # Set to evaluation mode (disables dropout/batchnorm updates)
         logger.info("✓ Froze all VAE parameters (requires_grad=False)")
+        logger.info("✓ Set VAE to evaluation mode (.eval())")
 
     # Count parameters AFTER freezing VAE to show correct trainable counts
     param_counts = model.count_parameters()

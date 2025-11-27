@@ -130,8 +130,8 @@ def create_comparison_visualization(
     if n_slices == 1:
         axes = axes.reshape(3, 1)
 
-    # Row labels
-    row_labels = ['Input (Thick)', 'Target (Thin)', 'Prediction (Thin)']
+    # Row labels (TEMPORARY DEBUG: Testing VAE reconstruction)
+    row_labels = ['Input (Thick)', 'Target (Thin)', 'VAE Reconstruction']
 
     for col_idx, slice_idx in enumerate(slice_indices):
         # Input: map thin slice index to thick slice index (6× ratio)
@@ -147,17 +147,17 @@ def create_comparison_visualization(
         axes[1, col_idx].set_title(f'Target Slice {slice_idx}')
         axes[1, col_idx].axis('off')
 
-        # Row 2: Prediction thin slice
+        # Row 2: VAE Reconstruction (TEMPORARY DEBUG)
         axes[2, col_idx].imshow(pred_patch[slice_idx], cmap='gray', vmin=-1, vmax=1)
-        axes[2, col_idx].set_title(f'Pred Slice {slice_idx}')
+        axes[2, col_idx].set_title(f'VAE Recon Slice {slice_idx}')
         axes[2, col_idx].axis('off')
 
     # Add row labels
     for row_idx, label in enumerate(row_labels):
         axes[row_idx, 0].set_ylabel(label, fontsize=14, fontweight='bold')
 
-    # Add title with metrics
-    title = f"Patient: {metadata.get('patient_id', 'N/A')} | Category: {metadata.get('category', 'N/A')}\n"
+    # Add title with metrics (TEMPORARY DEBUG: VAE Reconstruction Test)
+    title = f"[DEBUG: VAE RECONSTRUCTION TEST] Patient: {metadata.get('patient_id', 'N/A')} | Category: {metadata.get('category', 'N/A')}\n"
     title += f"PSNR: {metadata.get('psnr', 0):.2f} dB | SSIM: {metadata.get('ssim', 0):.4f}"
     fig.suptitle(title, fontsize=16, fontweight='bold')
 
@@ -196,21 +196,29 @@ def evaluate_patch(
         # Get target depth
         target_depth = target_tensor.shape[2]
 
+        # TEMPORARY DEBUG: Bypass diffusion, test VAE reconstruction only
         # Generate prediction (FP32 for stability)
         with torch.cuda.amp.autocast(enabled=False):
-            prediction = model.generate(
-                input_tensor,
-                sampler=sampler,
-                num_inference_steps=num_inference_steps,
-                target_depth=target_depth
-            )
+            # Original diffusion generation (commented out for debugging)
+            # prediction = model.generate(
+            #     input_tensor,
+            #     sampler=sampler,
+            #     num_inference_steps=num_inference_steps,
+            #     target_depth=target_depth
+            # )
 
-        # Clamp values
+            # DEBUG: Test VAE reconstruction with skip connections
+            # CRITICAL: Use forward() to enable skip connections (U-Net style)
+            prediction, _ = model.vae(target_tensor)  # Encode-decode with skip connections
+
+        # Clamp values and normalize to [0, 1] for metrics (consistent with VAE training)
         prediction = torch.clamp(prediction, -1, 1)
         target_clamped = torch.clamp(target_tensor, -1, 1)
+        prediction_norm = (prediction + 1.0) / 2.0      # [-1, 1] → [0, 1]
+        target_norm = (target_clamped + 1.0) / 2.0      # [-1, 1] → [0, 1]
 
-        # Calculate metrics (max_val=2.0 for range [-1, 1])
-        metrics = calculate_video_metrics(prediction, target_clamped, max_val=2.0)
+        # Calculate metrics with max_val=1.0 for [0, 1] range
+        metrics = calculate_video_metrics(prediction_norm, target_norm, max_val=1.0)
 
         return prediction, metrics
 
@@ -226,6 +234,13 @@ def main():
     print(f"\n{'='*80}")
     print(f"CT Slice Interpolation - Patch Evaluation & Visualization")
     print(f"{'='*80}\n")
+
+    # TEMPORARY DEBUG MODE
+    print(f"\n{'!'*80}")
+    print(f"! DEBUG MODE: BYPASSING DIFFUSION - TESTING VAE RECONSTRUCTION ONLY")
+    print(f"! This will encode target patches with VAE and decode them back")
+    print(f"! Expected PSNR: 38-45 dB if VAE is working correctly")
+    print(f"{'!'*80}\n")
 
     output_dirs = setup_output_dirs(args.output_dir)
     print(f"Output directory: {output_dirs['root']}")

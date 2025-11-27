@@ -293,6 +293,7 @@ class VAETrainer:
                 slice_type = "thin"
 
             # Forward pass with mixed precision
+            # CRITICAL: Uses encode→decode path (NO skip connections)
             if self.use_amp:
                 with autocast('cuda', dtype=torch.bfloat16):
                     # Encode → Decode (autoencoder forward pass)
@@ -402,6 +403,7 @@ class VAETrainer:
             thin_slices = batch['target'].to(self.device, non_blocking=True)  # (B, 1, 48, 192, 192)
 
             # Forward pass (deterministic) with mixed precision
+            # CRITICAL: Uses encode→decode path (NO skip connections)
             if self.use_amp:
                 with autocast('cuda', dtype=torch.bfloat16):
                     recon, z = self.vae(thin_slices)
@@ -443,7 +445,7 @@ class VAETrainer:
         logger.info(
             f"Validation Epoch {epoch} (thin slices) | "
             f"Loss: {avg_loss:.4f} | "
-            f"PSNR: {avg_psnr:.2f} dB | "
+            f"PSNR (encode→decode): {avg_psnr:.2f} dB | "
             f"SSIM: {avg_ssim:.4f}"
         )
 
