@@ -74,8 +74,8 @@ spec:
           sed -i 's/num_epochs: 20/num_epochs: 0/' /workspace/config/vae_training.yaml
 
           # Run training script (will preprocess then exit)
-          python /workspace/train_vae.py \
-            --config /workspace/config/vae_training.yaml \
+          cd /workspace && python -m training.train_vae \
+            --config config/vae_training.yaml \
             2>&1 | tee /workspace/storage_a100/logs/preprocessing_$(date +%Y%m%d_%H%M%S).log
 
           # Restore original config

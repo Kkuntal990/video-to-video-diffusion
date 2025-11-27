@@ -46,8 +46,8 @@ spec:
             echo "✓ Resuming training from best checkpoint..."
             echo ""
 
-            # Resume training
-            python train_vae.py \
+            # Resume training (add workspace to PYTHONPATH)
+            cd /workspace && python -m training.train_vae \
               --config config/vae_training.yaml \
               --resume "$CHECKPOINT_PATH"
 
@@ -56,8 +56,8 @@ spec:
             echo "✓ Starting fresh VAE training..."
             echo ""
 
-            # Start fresh training
-            python train_vae.py \
+            # Start fresh training (add workspace to PYTHONPATH)
+            cd /workspace && python -m training.train_vae \
               --config config/vae_training.yaml
           fi
 

@@ -148,5 +148,6 @@ Look for ARCHITECTURE.md file if need more info for each componenet.
 - Do not create any documentation except when explicitly asked. When asked to create documentation, always create in ./docs folder
 - Do not commit and push unless explicitly stated.
 - Never deploy on kubernetes, always give commands to deploy.
+- Do not run large model tests on local, it crashes the system
 
-## End of Context Document**
+## End of Context Document

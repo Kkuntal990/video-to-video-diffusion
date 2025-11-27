@@ -8,7 +8,7 @@
 # Model Configuration - Lightweight VAE
 model:
   in_channels: 1  # Grayscale CT scans
-  latent_dim: 8  # Standard latent dimension
+  latent_dim: 16  # Increased from 8 for better reconstruction (4× compression)
   vae_base_channels: 128  # Base channels for encoder/decoder
   vae_scaling_factor: 1.0  # Standard VAE scaling
 
@@ -16,9 +16,6 @@ model:
   use_pretrained: false
   use_custom_maisi: false
   use_maisi: false
-
-  # Skip connections DISABLED (hardcoded in vae.py for latent diffusion)
-  # use_skip_connections: false  # Not needed - always false now
 
 # Data Configuration - Patch-based for memory efficiency
 data:
@@ -46,8 +43,8 @@ data:
   seed: 42
 
   # Limit dataset size for debugging (null = use all samples)
-  max_train_samples: null  # Set to 2 for quick debug, null for full training
-  max_val_samples: null    # Limit validation samples (optional)
+  max_train_samples: 20  # Set to 2 for quick debug, null for full training
+  max_val_samples: 4    # Limit validation samples (optional)
 
   # DataLoader settings (increased batch size - skip connections removed!)
   batch_size: 1  # Increased from 1 (skip connections removed = less memory)
@@ -61,7 +58,7 @@ training:
   learning_rate: 0.0001  # 1e-4
   weight_decay: 0.00001
 
-  model_suffix: 'custom_vae_no_skips'  # No skip connections - for latent diffusion
+  model_suffix: 'custom_vae_no_skips_overfit'  # No skip connections - for latent diffusion
 
   # Slice sampling ratio during training
   # Controls how often the VAE trains on thick vs thin slices
