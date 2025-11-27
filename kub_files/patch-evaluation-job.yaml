@@ -14,11 +14,12 @@ spec:
       restartPolicy: Never
       containers:
       - name: patch-eval
-        image: kuntalkokate/llm_agent_v2v_train:latest
-        command:
-          - /bin/bash
-          - -c
-          - |
+        image: ghcr.io/kkuntal990/v2v-diffusion:latest
+        imagePullPolicy: Always
+        command: ["/bin/bash"]
+        args:
+        - "-c"
+        - |
             echo "Starting Patch Evaluation..."
             echo "GPU Info:"
             nvidia-smi
