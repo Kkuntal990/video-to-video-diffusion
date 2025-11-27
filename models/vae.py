@@ -1,8 +1,16 @@
 """
-3D Video VAE (Variational Autoencoder)
+3D Slice Interpolation VAE (Variational Autoencoder)
 
-Encoder: Compresses video (T×H×W×3) into latent space (T×h×w×c)
-Decoder: Reconstructs video from latent representation
+Spatial compression: 4× (H,W → H//4, W//4)
+Temporal: Preserved (T → T, no depth compression)
+
+Encoder: Compresses CT volumes (B, C, T, H, W) into latent space (B, latent_dim, T, H//4, W//4)
+Decoder: Reconstructs CT volumes from latent representation
+
+Architecture:
+- 2 downsample stages (spatial 2×2 each = 4× total)
+- No skip connections (designed for latent diffusion)
+- Depth preserved throughout
 """
 
 import torch
@@ -69,11 +77,10 @@ class DownsampleBlock(nn.Module):
 
 
 class UpsampleBlock(nn.Module):
-    """Upsampling block with 3D transposed convolution and optional skip connections"""
+    """Upsampling block with 3D transposed convolution"""
 
-    def __init__(self, in_channels, out_channels, use_skip=False):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.use_skip = use_skip
 
         # Upsample spatial dimensions (H, W) by 2, keep temporal (T) same
         self.conv = nn.ConvTranspose3d(in_channels, out_channels,
@@ -83,24 +90,10 @@ class UpsampleBlock(nn.Module):
         self.norm = nn.GroupNorm(num_groups=8, num_channels=out_channels)
         self.act = nn.SiLU()
 
-        # If using skip connections, add 1x1 conv to merge concatenated features
-        # After concat: out_channels (upsampled) + out_channels (skip) = 2 * out_channels
-        if use_skip:
-            self.skip_conv = nn.Conv3d(out_channels * 2, out_channels, kernel_size=1)
-
-    def forward(self, x, skip=None):
-        # Upsample
+    def forward(self, x):
         x = self.conv(x)
         x = self.norm(x)
         x = self.act(x)
-
-        # Merge skip connection if provided
-        if self.use_skip and skip is not None:
-            # Concatenate along channel dimension
-            x = torch.cat([x, skip], dim=1)  # (B, 2*C, T, H, W)
-            # Merge with 1x1 conv
-            x = self.skip_conv(x)            # (B, C, T, H, W)
-
         return x
 
 
@@ -108,7 +101,7 @@ class VideoEncoder(nn.Module):
     """
     3D Video Encoder
     Input: (B, 3, T, H, W) - video clip
-    Output: (B, latent_dim, T, H//8, W//8) - latent representation
+    Output: (B, latent_dim, T, H//4, W//4) - latent representation
     """
 
     def __init__(self, in_channels=3, latent_dim=4, base_channels=64):
@@ -117,7 +110,7 @@ class VideoEncoder(nn.Module):
         # Initial conv
         self.conv_in = Conv3DBlock(in_channels, base_channels)
 
-        # Encoder blocks with downsampling (3 stages, downsample by 8)
+        # Encoder blocks with downsampling (2 stages, downsample by 4)
         self.down1 = nn.Sequential(
             ResBlock3D(base_channels),
             ResBlock3D(base_channels),
@@ -128,12 +121,6 @@ class VideoEncoder(nn.Module):
             ResBlock3D(base_channels * 2),
             ResBlock3D(base_channels * 2),
             DownsampleBlock(base_channels * 2, base_channels * 4)
-        )
-
-        self.down3 = nn.Sequential(
-            ResBlock3D(base_channels * 4),
-            ResBlock3D(base_channels * 4),
-            DownsampleBlock(base_channels * 4, base_channels * 4)
         )
 
         # Middle blocks
@@ -149,37 +136,26 @@ class VideoEncoder(nn.Module):
         # Quantization layer: 8 → latent_dim (typically 4)
         self.quant_conv = nn.Conv3d(8, latent_dim, kernel_size=1)
 
-    def forward(self, x, return_skips=False):
+    def forward(self, x):
         # Input: (B, 3, T, H, W)
         h0 = self.conv_in(x)       # (B, 64, T, H, W)         - spatial: H×W
         h1 = self.down1(h0)        # (B, 128, T, H//2, W//2)  - spatial: H/2×W/2
         h2 = self.down2(h1)        # (B, 256, T, H//4, W//4)  - spatial: H/4×W/4
-        h3 = self.down3(h2)        # (B, 256, T, H//8, W//8)  - spatial: H/8×W/8
-        h = self.mid(h3)           # (B, 256, T, H//8, W//8)
-        h = self.conv_out(h)       # (B, 8, T, H//8, W//8)
-        z = self.quant_conv(h)     # (B, latent_dim, T, H//8, W//8)
-
-        if return_skips:
-            # Return skip connections from each encoder level
-            # Order: [h0, h1, h2] - we don't need h3 (bottleneck level)
-            # Decoder upsamples then concatenates, so skip must match upsampled size:
-            # - up1 upsamples to H/4×W/4, use h2 (H/4×W/4)
-            # - up2 upsamples to H/2×W/2, use h1 (H/2×W/2)
-            # - up3 upsamples to H×W, use h0 (H×W)
-            return z, [h0, h1, h2]
+        h = self.mid(h2)           # (B, 256, T, H//4, W//4)
+        h = self.conv_out(h)       # (B, 8, T, H//4, W//4)
+        z = self.quant_conv(h)     # (B, latent_dim, T, H//4, W//4)
         return z
 
 
 class VideoDecoder(nn.Module):
     """
-    3D Video Decoder
-    Input: (B, latent_dim, T, H//8, W//8) - latent representation
-    Output: (B, 3, T, H, W) - reconstructed video
+    3D Slice Interpolation Decoder
+    Input: (B, latent_dim, T, H//4, W//4) - latent representation
+    Output: (B, 3, T, H, W) - reconstructed CT slices
     """
 
-    def __init__(self, latent_dim=4, out_channels=3, base_channels=64, use_skip_connections=True):
+    def __init__(self, latent_dim=4, out_channels=3, base_channels=64):
         super().__init__()
-        self.use_skip_connections = use_skip_connections
 
         # Post-quantization layer: latent_dim → 8 (match SD VAE architecture)
         self.post_quant_conv = nn.Conv3d(latent_dim, 8, kernel_size=1)
@@ -193,23 +169,16 @@ class VideoDecoder(nn.Module):
             ResBlock3D(base_channels * 4),
         )
 
-        # Decoder blocks with upsampling (3 stages, upsample by 8)
-        # up1: 256 → 256 (with skip from encoder down3: 256 channels)
-        self.up1_upsample = UpsampleBlock(base_channels * 4, base_channels * 4, use_skip=use_skip_connections)
-        self.up1_res = nn.Sequential(
-            ResBlock3D(base_channels * 4),
-            ResBlock3D(base_channels * 4),
-        )
-
-        # up2: 256 → 128 (with skip from encoder down2: 256 channels)
-        self.up2_upsample = UpsampleBlock(base_channels * 4, base_channels * 2, use_skip=use_skip_connections)
+        # Decoder blocks with upsampling (2 stages, upsample by 4)
+        # up2: 256 → 128
+        self.up2_upsample = UpsampleBlock(base_channels * 4, base_channels * 2)
         self.up2_res = nn.Sequential(
             ResBlock3D(base_channels * 2),
             ResBlock3D(base_channels * 2),
         )
 
-        # up3: 128 → 64 (with skip from encoder down1: 128 channels)
-        self.up3_upsample = UpsampleBlock(base_channels * 2, base_channels, use_skip=use_skip_connections)
+        # up3: 128 → 64
+        self.up3_upsample = UpsampleBlock(base_channels * 2, base_channels)
         self.up3_res = nn.Sequential(
             ResBlock3D(base_channels),
             ResBlock3D(base_channels),
@@ -218,81 +187,57 @@ class VideoDecoder(nn.Module):
         # Output conv
         self.conv_out = nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1)
 
-    def forward(self, x, skips=None):
-        # Input: (B, latent_dim, T, H//8, W//8)
-        x = self.post_quant_conv(x)  # (B, 8, T, H//8, W//8)
-        x = self.conv_in(x)          # (B, 256, T, H//8, W//8)
-        x = self.mid(x)              # (B, 256, T, H//8, W//8)
+    def forward(self, x):
+        # Input: (B, latent_dim, T, H//4, W//4)
+        x = self.post_quant_conv(x)  # (B, 8, T, H//4, W//4)
+        x = self.conv_in(x)          # (B, 256, T, H//4, W//4)
+        x = self.mid(x)              # (B, 256, T, H//4, W//4)
 
-        # Decoder with skip connections (U-Net style)
-        # Skips are in order: [h0, h1, h2] from encoder (conv_in, down1, down2)
-        # Spatial resolutions: h0=H×W, h1=H/2×W/2, h2=H/4×W/4
-        # UpsampleBlock upsamples FIRST, then concatenates, so skip must match upsampled size
-        if self.use_skip_connections and skips is not None:
-            # up1: upsample 24×24 → 48×48, then concat with h2 (48×48)
-            x = self.up1_upsample(x, skip=skips[2])  # (B, 256, T, H//4, W//4)
-            x = self.up1_res(x)
-
-            # up2: upsample 48×48 → 96×96, then concat with h1 (96×96)
-            x = self.up2_upsample(x, skip=skips[1])  # (B, 128, T, H//2, W//2)
-            x = self.up2_res(x)
-
-            # up3: upsample 96×96 → 192×192, then concat with h0 (192×192)
-            x = self.up3_upsample(x, skip=skips[0])  # (B, 64, T, H, W)
-            x = self.up3_res(x)
-        else:
-            # No skip connections (backward compatibility)
-            x = self.up1_upsample(x)     # (B, 256, T, H//4, W//4)
-            x = self.up1_res(x)
-            x = self.up2_upsample(x)     # (B, 128, T, H//2, W//2)
-            x = self.up2_res(x)
-            x = self.up3_upsample(x)     # (B, 64, T, H, W)
-            x = self.up3_res(x)
+        # Decoder upsampling
+        x = self.up2_upsample(x)     # (B, 128, T, H//2, W//2)
+        x = self.up2_res(x)
+        x = self.up3_upsample(x)     # (B, 64, T, H, W)
+        x = self.up3_res(x)
 
         x = self.conv_out(x)      # (B, 1, T, H, W)
-        x = torch.tanh(x)         # ✅ CRITICAL FIX: Bound output to [-1, 1]
+        x = torch.tanh(x)         # Bound output to [-1, 1]
         return x
 
 
-class VideoVAE(nn.Module):
+class SliceInterpolationVAE(nn.Module):
     """
-    Complete Video VAE with Encoder and Decoder
+    3D VAE for CT Slice Interpolation
 
-    Compresses videos into latent space and reconstructs them.
-    Input/Output format: (B, C, T, H, W)
-
-    IMPORTANT: For latent diffusion, skip connections are DISABLED.
-    Encoder and decoder must work independently.
+    Compresses 3D CT volumes into latent space and reconstructs them.
+    Designed for latent diffusion models - encoder and decoder work independently.
+    Input/Output format: (B, C, T, H, W) where T is depth (number of slices)
     """
 
     def __init__(self, in_channels=3, latent_dim=4, base_channels=64, scaling_factor=0.18215,
-                 gradient_checkpointing=False, use_skip_connections=False):
+                 gradient_checkpointing=False):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.in_channels = in_channels
         self.gradient_checkpointing = gradient_checkpointing
-        # FORCE skip connections to False for latent diffusion compatibility
-        self.use_skip_connections = False  # Encoder/decoder must work independently
 
-        # Use custom VideoVAE architecture WITHOUT skip connections
+        # Initialize encoder and decoder
         self.encoder = VideoEncoder(in_channels, latent_dim, base_channels)
-        self.decoder = VideoDecoder(latent_dim, in_channels, base_channels, use_skip_connections=False)
+        self.decoder = VideoDecoder(latent_dim, in_channels, base_channels)
 
         # Scaling factor for latent space normalization
         # Standard SD VAE uses 0.18215, but this should be calculated from your dataset
         # To calculate: scale = 1 / std(latent_activations)
         self.scaling_factor = scaling_factor
-        print(f"✓ Initialized custom VideoVAE (latent diffusion mode)")
-        print(f"  Skip connections: DISABLED (encoder/decoder work independently)")
+        print(f"✓ Initialized Slice Interpolation VAE")
         print(f"  Latent dim: {latent_dim}, Base channels: {base_channels}")
 
     def encode(self, x):
         """
-        Encode video to latent space with scaling
+        Encode CT volume to latent space with scaling
 
         Args:
-            x: (B, C, T, H, W) video tensor in range [-1, 1]
+            x: (B, C, T, H, W) CT volume tensor in range [-1, 1]
         Returns:
             z: (B, latent_dim, T, h, w) scaled latent tensor
         """
@@ -303,12 +248,12 @@ class VideoVAE(nn.Module):
 
     def decode(self, z):
         """
-        Decode latent to video with unscaling
+        Decode latent to CT volume with unscaling
 
         Args:
             z: (B, latent_dim, T, h, w) scaled latent tensor
         Returns:
-            x: (B, C, T, H, W) reconstructed video in range [-1, 1]
+            x: (B, C, T, H, W) reconstructed CT volume in range [-1, 1]
         """
         # Unscale latents before decoding
         z = z / self.scaling_factor
@@ -316,13 +261,13 @@ class VideoVAE(nn.Module):
 
     def encode_with_posterior(self, x):
         """
-        Encode video and return posterior distribution parameters (mu, logvar).
+        Encode CT volume and return posterior distribution parameters (mu, logvar).
 
         For VAE training from scratch.
         Splits the encoder output into mean and log variance.
 
         Args:
-            x: (B, C, T, H, W) video tensor in range [-1, 1]
+            x: (B, C, T, H, W) CT volume tensor in range [-1, 1]
 
         Returns:
             mu: (B, latent_dim//2, T, h, w) mean of latent distribution
@@ -343,31 +288,28 @@ class VideoVAE(nn.Module):
 
     def forward(self, x):
         """
-        Full forward pass: encode then decode (NO skip connections)
-
-        This is the ONLY training path. Encoder and decoder work independently.
+        Full forward pass: encode then decode
 
         Args:
-            x: (B, C, T, H, W) video tensor in range [-1, 1]
+            x: (B, C, T, H, W) CT volume tensor in range [-1, 1]
         Returns:
-            recon: (B, C, T, H, W) reconstructed video in range [-1, 1]
+            recon: (B, C, T, H, W) reconstructed CT volume in range [-1, 1]
             z: (B, latent_dim, T, h, w) scaled latent representation
         """
-        # Always use encode/decode path (no skips)
         z = self.encode(x)
         recon = self.decode(z)
         return recon, z
 
-    def get_latent_shape(self, video_shape):
-        """Calculate latent shape given video shape"""
-        B, C, T, H, W = video_shape
-        return (B, self.latent_dim, T, H // 8, W // 8)
+    def get_latent_shape(self, volume_shape):
+        """Calculate latent shape given CT volume shape"""
+        B, C, T, H, W = volume_shape
+        return (B, self.latent_dim, T, H // 4, W // 4)
 
     @classmethod
     def from_pretrained(cls, model_name_or_path, method='auto', inflate_method='central',
                        strict=True, device='cpu', **kwargs):
         """
-        Load VideoVAE from pretrained weights (DISABLED)
+        Load Slice Interpolation VAE from pretrained weights (DISABLED)
 
         This method is not implemented. Use custom trained VAE instead.
         Load weights manually via torch.load() and model.load_state_dict().
@@ -379,28 +321,32 @@ class VideoVAE(nn.Module):
         )
 
 
+# Backward compatibility alias
+VideoVAE = SliceInterpolationVAE
+
+
 if __name__ == "__main__":
-    # Test the VAE
+    # Test the Slice Interpolation VAE (4× spatial compression)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create model
-    vae = VideoVAE(in_channels=3, latent_dim=4, base_channels=64).to(device)
+    # Create model with increased latent capacity
+    vae = SliceInterpolationVAE(in_channels=1, latent_dim=16, base_channels=128).to(device)
 
-    # Test with random video (batch=2, channels=3, frames=16, height=256, width=256)
-    video = torch.randn(2, 3, 16, 256, 256).to(device)
+    # Test with random CT volume (batch=2, channels=1, slices=48, height=192, width=192)
+    volume = torch.randn(2, 1, 48, 192, 192).to(device)
 
-    print(f"Input shape: {video.shape}")
+    print(f"Input shape: {volume.shape}")
 
-    # Encode
-    latent = vae.encode(video)
-    print(f"Latent shape: {latent.shape}")
+    # Encode (192×192 → 48×48, 4× compression)
+    latent = vae.encode(volume)
+    print(f"Latent shape: {latent.shape}")  # Expected: (2, 16, 48, 48, 48)
 
-    # Decode
+    # Decode (48×48 → 192×192)
     recon = vae.decode(latent)
     print(f"Reconstruction shape: {recon.shape}")
 
     # Full forward
-    recon, latent = vae(video)
+    recon, latent = vae(volume)
     print(f"Forward pass - Recon: {recon.shape}, Latent: {latent.shape}")
 
     # Count parameters

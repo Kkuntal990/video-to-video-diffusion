@@ -88,8 +88,7 @@ def load_vae_checkpoint(checkpoint_path: str, config: Dict, device: str) -> Vide
     vae = VideoVAE(
         in_channels=config['model']['in_channels'],
         latent_dim=config['model']['latent_dim'],
-        base_channels=config['model']['vae_base_channels'],
-        use_skip_connections=True
+        base_channels=config['model']['vae_base_channels']
     )
 
     # Load checkpoint

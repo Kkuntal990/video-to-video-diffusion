@@ -30,7 +30,7 @@ spec:
           echo ""
 
           # Use custom MAISI VAE config (100% pretrained weights)
-          python train.py --config config/slice_interpolation_full_medium.yaml
+          cd /workspace && python -m training.train --config config/slice_interpolation_full_medium.yaml
 
           echo "Training completed!"
 

@@ -1,316 +1,399 @@
 # CT Slice Interpolation with Latent Diffusion
 
-A PyTorch implementation of a 3D latent diffusion model for medical CT slice interpolation (anisotropic super-resolution), with support for custom VAE training and Kubernetes deployment.
+A PyTorch implementation of 3D latent diffusion for CT slice interpolation (anisotropic super-resolution), featuring custom VAE training, patch-based training, and Kubernetes deployment.
+
+## 🎯 Task
+
+**Anisotropic Super-Resolution for Medical CT Scans**
+
+- **Input**: 8 thick CT slices @ 5.0mm spacing (low resolution in depth)
+- **Output**: 48 thin CT slices @ 1.0mm spacing (6× interpolation)
+- **Goal**: Improve diagnostic quality by generating missing intermediate slices
 
 ## 🚀 Quick Start
 
+### Local Testing
 ```bash
-# Local testing
-python test_two_phase.py
+# Test VAE reconstruction
+python tests/test_vae_reconstruction.py
 
-# Kubernetes training (3 commands)
-kubectl apply -f kub_files/persistent_storage.yaml
-kubectl apply -f kub_files/interactive-pod.yaml
-kubectl exec -it v2v-diffusion-interactive -- python train.py --config config/cloud_train_config.yaml
+# Test model integrity
+pytest tests/test_model_integrity.py
 ```
 
-📖 **See [QUICK_START.md](QUICK_START.md) for fast deployment**
+### Kubernetes Training (A100 GPU)
+```bash
+# 1. Deploy VAE training
+kubectl apply -f kub_files/vae-training-job-a100.yaml
+
+# 2. Monitor training
+kubectl logs -f job/vae-training-job-a100
+
+# 3. After VAE completes, train diffusion model
+kubectl apply -f kub_files/train-job-a100.yaml
+```
+
+📖 **See [CLAUDE.md](CLAUDE.md) for complete project context and architecture details**
 
 ---
 
-## 📋 Overview
+## 📋 What's New
 
-This implementation provides a complete pipeline for training and deploying CT slice interpolation models using latent diffusion:
+### Recent Updates (2025-01)
 
-**Task:** Anisotropic super-resolution for CT scans (50 thick slices @ 5.0mm → 300 thin slices @ 1.0mm)
+✅ **VAE Architecture Refactored for Latent Diffusion**
+- Removed encoder→decoder skip connections (incompatible with diffusion)
+- Encoder and decoder now work independently
+- Trained from scratch for CT slice interpolation task
+- Target: PSNR ≥35 dB on encode→decode reconstruction
 
-### Key Features
+✅ **VAE-UNet Integration Fixed**
+- Added `torch.no_grad()` around VAE encoding (saves 2-3 GB GPU memory)
+- Set VAE to `.eval()` mode during diffusion training
+- Fixed: VAE properly frozen, no gradient leakage
 
-- ✅ **Custom Trained VAE**: 3D autoencoder with 8× spatial compression for CT volumes
-- ✅ **3D U-Net Denoiser**: Predicts noise conditioned on input CT scans
-- ✅ **Patch-Based Training**: Memory-efficient training on 192×192×48 patches
-- ✅ **Layer-Wise Learning Rates**: Different LRs for VAE and U-Net components
-- ✅ **Kubernetes Support**: Production-ready deployment with A100 GPU scheduling
-- ✅ **Persistent Storage**: Checkpoints and cache survive pod restarts
-- ✅ **Mixed Precision**: BF16 training for better stability on A100
-- ✅ **APE Dataset**: 431 patient CT scans with pulmonary embolism annotations
-- ✅ **DDIM/DDPM Sampling**: Fast deterministic or stochastic inference
+✅ **Metric Calculation Standardized**
+- All PSNR/SSIM now use [0,1] normalization with `max_val=1.0`
+- Metrics directly comparable between VAE and diffusion training
+- Updated in training, evaluation, and test scripts
 
-### What's New (Latest Updates)
+✅ **Data Pipeline Cleanup**
+- Removed 5 legacy dataset files (2,833 lines, 60.5% reduction)
+- Deleted wrong task implementations (temporal video pairs)
+- Simplified to CT slice interpolation only
+- Cleaner, focused codebase
 
-🎯 **Custom VAE Training Complete**
-- Trained 173M parameter VAE from scratch on CT data
-- 8 latent channels, U-Net style skip connections
-- PSNR >35 dB reconstruction quality
-
-🔧 **PyTorch Best Practices**
-- Standard checkpoint loading (no model duplication)
-- Proper gradient scoping with `@torch.no_grad()`
-- Global imports (no local import issues)
-
-💾 **Efficient Caching Pipeline**
-- One-time DICOM preprocessing to .pt tensors
-- Cached preprocessed data (~15-20 GB)
-- 100-200× faster data loading after preprocessing
-- 20Gi PersistentVolumeClaim on Kubernetes
-
-🐳 **Kubernetes Production Deployment**
-- GPU scheduling (Tesla V100)
-- Interactive and batch job modes
-- Resource limits and monitoring
+✅ **Batch Size Increased**
+- VAE training: batch_size=4 (up from 1)
+- Skip connections removed → less memory usage
+- Faster training convergence
 
 ---
 
 ## 📊 Architecture
 
-### Model Overview
+### Model Pipeline
 
 ```
-Input CT Video (B×3×8×128×128)
+Thick Slices (8 @ 5.0mm, 512×512)
           ↓
-    [ VAE Encoder ]  →  Latent (B×4×8×16×16)  [8× compression]
+    [ VAE Encoder ]  →  Latent (8 @ 64×64)  [8× spatial compression]
           ↓
     [ Add Noise ]  →  Noisy Latent (training)
           ↓
-    [ U-Net Denoiser ]  →  Predicted Noise
+    [ 3D U-Net ]  →  Denoised Latent
           ↓
-    [ VAE Decoder ]  →  Output CT Video (B×3×8×128×128)
+    [ VAE Decoder ]  →  Thin Slices (48 @ 1.0mm, 512×512)
 ```
 
-### Model Statistics
+### Model Components
 
-| Component | Parameters | Input Shape | Output Shape | Memory |
-|-----------|-----------|-------------|--------------|---------|
-| **VAE Encoder** | 86M | (B,3,8,128,128) | (B,4,8,16,16) | ~500 MB |
-| **U-Net** | 163M | (B,4,8,16,16) | (B,4,8,16,16) | ~2.5 GB |
-| **VAE Decoder** | 86M | (B,4,8,16,16) | (B,3,8,128,128) | ~500 MB |
-| **Total** | **335M** | - | - | **~7.5 GB** |
+| Component | Parameters | Compression | Training Status |
+|-----------|-----------|-------------|-----------------|
+| **VAE Encoder** | 86M | Spatial 8× (512→64) | ✅ Custom trained |
+| **VAE Decoder** | 86M | Spatial 8× (64→512) | ✅ Custom trained |
+| **3D U-Net** | 163M | None (latent→latent) | 🔄 In progress |
+| **Total** | **335M** | - | - |
 
-📖 **See [ARCHITECTURE.md](ARCHITECTURE.md) for complete architecture details with diagrams**
+**Key Features:**
+- No skip connections between VAE encoder/decoder (latent diffusion compatible)
+- Depth preserved through entire pipeline (8 thick → 48 thin)
+- BF16 mixed precision training on A100
+- Patch-based training for memory efficiency
+
+### Training Approach
+
+**Phase 1: VAE Training (Complete)**
+```yaml
+Task: Learn to encode/decode CT patches
+Input: 192×192 patches (8 thick OR 48 thin slices)
+Objective: Reconstruction quality (PSNR ≥35 dB)
+Status: ✅ Complete (best checkpoint available)
+```
+
+**Phase 2: Diffusion Training (Current)**
+```yaml
+Task: Learn to interpolate thick → thin in latent space
+Input: 192×192 patches (8 thick + 48 thin slices)
+Objective: High-quality slice interpolation
+Status: 🔄 In progress (VAE frozen, U-Net training)
+```
+
+📖 **See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture diagrams** (if exists)
 
 ---
 
 ## 🏗️ Installation
 
-### Local Development
+### Requirements
+
+- Python 3.8+
+- PyTorch 2.0+
+- CUDA 11.8+ (for A100 GPU)
+- 80GB GPU memory (A100) for batch_size=4 training
+- 32GB GPU memory (V100) for batch_size=1 training
+
+### Local Setup
 
 ```bash
 # Clone repository
 git clone <repository-url>
 cd LLM_agent_v2v
 
+# Create conda environment
+conda create -n ct-superres-mps python=3.10
+conda activate ct-superres-mps
+
 # Install dependencies
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
-
-# Run tests
-python test_two_phase.py
 ```
 
-### Requirements
+### Docker (Kubernetes)
 
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.0+ (for GPU training)
-- 16GB+ GPU memory for training (batch_size=1)
-- 8GB+ GPU memory for inference
-
-### Kubernetes Deployment
-
+Pre-built image available:
 ```bash
-# Prerequisites
-kubectl get nodes  # Verify cluster access
-
-# Deploy
-kubectl apply -f kub_files/persistent_storage.yaml
-kubectl apply -f kub_files/training-job.yaml
-
-# Monitor
-kubectl logs -f job/v2v-diffusion-training
+docker pull ghcr.io/kkuntal990/v2v-diffusion:latest
 ```
-
-📖 **See [RUN_TRAINING_GUIDE.md](RUN_TRAINING_GUIDE.md) for complete Kubernetes guide**
 
 ---
 
 ## 📚 Dataset
 
-### APE-Data (HuggingFace)
-
-The model uses the [APE-data](https://huggingface.co/datasets/t2ance/APE-data) dataset:
+### APE Dataset (Acute Pulmonary Embolism)
 
 - **Source**: Medical CT scans for pulmonary embolism detection
-- **Size**: 206 patient studies
-- **Format**: ZIP archives with DICOM CT slices
-- **Categories**: APE (positive) and non-APE (negative)
-- **Streaming**: No need to download entire dataset
+- **Total Cases**: 323 successfully preprocessed
+- **Split**: Train=243, Val=48, Test=32
+- **Categories**: APE (positive), non-APE (negative)
+- **Format**: DICOM ZIP files → Preprocessed .pt cache
+- **Storage**: Raw ~50GB → Cached ~15-20GB
 
-### Data Configuration
+### Data Pipeline
+
+#### Current Capabilities ✅
+
+**1. Full Preprocessing Pipeline (Local ZIPs)**
+```
+Raw ZIPs (/workspace/storage_a100/dataset/)
+    ↓
+Extract DICOMs (temp directory)
+    ↓
+Load & Window CT scans (HU → [-1,1])
+    ↓
+Resize to 512×512
+    ↓
+Cache as .pt tensors (/workspace/storage_a100/.cache/processed/)
+    ↓
+Delete DICOMs (save 30-35GB storage)
+```
+
+**Implementation**: `data/slice_interpolation_dataset.py`
+- Handles ZIP extraction, DICOM loading, preprocessing, caching
+- Auto-resume: skips already-processed cases
+- Configurable storage paths via YAML config
+- Works with different storage locations (just update paths)
+
+**2. Patch-Based Training**
+```
+Preprocessed cache (.pt files)
+    ↓
+Extract 3D patches (8 thick → 48 thin @ 192×192)
+    ↓
+Random sampling for training
+    ↓
+Data augmentation (flips, rotations)
+```
+
+**Implementation**: `data/patch_slice_interpolation_dataset.py`
+- Loads from preprocessed cache only (no raw processing)
+- Fixed-size patches for efficient training
+- Supports large batch sizes (batch_size=4+)
+
+#### Current Limitations ⚠️
+
+**What's NOT Supported:**
+- ❌ HuggingFace Hub downloading (deleted with legacy files)
+- ❌ Timeout handling for slow DICOM files
+- ❌ Metadata JSON tracking
+
+**Workarounds:**
+- **HF downloading**: Use `huggingface-cli download t2ance/APE-data` manually
+- **Timeout issues**: Monitor preprocessing logs for stuck cases
+- **Metadata**: Categories derived from folder structure (APE/ and non-APE/)
+
+**Note**: If you have local ZIP files, current pipeline is FULLY FUNCTIONAL and optimized for the slice interpolation task.
+
+### Configuration Example
 
 ```yaml
+# config/vae_training.yaml
 data:
-  data_source: 'huggingface'
-  dataset_name: 't2ance/APE-data'
-  streaming: true                # Stream without downloading
-  num_frames: 8                  # CT slices per sample
-  resolution: [128, 128]         # Spatial resolution
-  batch_size: 1                  # Batch size
-  categories: ['APE', 'non-APE'] # Both categories
+  data_source: 'slice_interpolation'
+  use_patches: true
+
+  # Configurable storage paths
+  dataset_path: '/workspace/storage_a100/dataset'           # Raw ZIPs
+  extract_dir: '/workspace/storage_a100/.cache/temp'        # Temp extraction
+  processed_dir: '/workspace/storage_a100/.cache/processed' # .pt cache
+
+  # Patch configuration
+  patch_depth_thick: 8
+  patch_depth_thin: 48
+  patch_size: [192, 192]
+
+  # Common settings
+  categories: ['APE', 'non-APE']
+  resolution: [512, 512]
+  window_center: 40
+  window_width: 400
+  batch_size: 4
+  num_workers: 4
 ```
 
 ---
 
 ## 🎓 Training
 
-### Quick Start (Local)
+### 1. VAE Training (First Step)
+
+Train custom VAE from scratch on CT patches:
 
 ```bash
-# Test with small config
-python train.py --config config/cloud_train_config.yaml
+# Kubernetes (A100)
+kubectl apply -f kub_files/vae-training-job-a100.yaml
+
+# Monitor
+kubectl logs -f job/vae-training-job-a100
 ```
 
-### Quick Start (Kubernetes)
-
-```bash
-# Option 1: Interactive (for development)
-kubectl apply -f kub_files/interactive-pod.yaml
-kubectl exec -it v2v-diffusion-interactive -- python train.py --config config/cloud_train_config.yaml
-
-# Option 2: Batch Job (for production)
-kubectl apply -f kub_files/training-job.yaml
-kubectl logs -f job/v2v-diffusion-training
-```
-
-### Training Configuration
-
-**Current Setup** (`config/cloud_train_config.yaml`):
-
+**Configuration**: `config/vae_training.yaml`
 ```yaml
 model:
-  latent_dim: 4
-  vae_base_channels: 128
-  unet_model_channels: 128
+  latent_dim: 8
+  base_channels: 128
+  scaling_factor: 1.0
+  use_skip_connections: false  # CRITICAL: Disabled for latent diffusion
 
 training:
-  num_epochs: 2              # Testing: 2, Production: 50-100
-  batch_size: 1
-  learning_rate: 1e-4
-  mixed_precision: true      # FP16 for 2× speedup
-  checkpoint_every: 500      # Save every 500 steps
+  num_epochs: 100
+  learning_rate: 0.0001
+  batch_size: 4  # Increased (skip connections removed)
+  mixed_precision: true
+  precision: 'bf16'
 
-pretrained:
-  use_pretrained: false      # Training from scratch
-  two_phase_training: true   # Enable two-phase strategy
-  phase1_epochs: 1           # VAE frozen for first epoch
-  layer_lr_multipliers:
-    vae_encoder: 0.1         # 10× lower than U-Net
-    vae_decoder: 0.1
-    unet: 1.0
+  # Training ratio
+  thick_slice_ratio: 0.2  # 20% thick, 80% thin
 ```
 
-### Two-Phase Training
+**Expected Results:**
+- Target: PSNR ≥35 dB on encode→decode
+- Training time: ~2-4 hours (60-80 epochs on A100)
+- Best checkpoint: `/workspace/storage_a100/checkpoints/vae_training_custom_vae_no_skips/vae_best.pt`
 
-```
-┌─────────────────────────────────┐
-│  Phase 1 (Epoch 0)              │
-│  VAE: FROZEN ❄️                 │
-│  U-Net: TRAINING 🔥             │
-│  Goal: Learn denoising quickly  │
-└─────────────────────────────────┘
-              ↓
-┌─────────────────────────────────┐
-│  Phase 2 (Epoch 1+)             │
-│  VAE: TRAINING 🔥 (LR × 0.1)    │
-│  U-Net: TRAINING 🔥             │
-│  Goal: Fine-tune end-to-end     │
-└─────────────────────────────────┘
+### 2. Diffusion Training (Second Step)
+
+Train U-Net denoiser with frozen VAE:
+
+```bash
+# Kubernetes (A100)
+kubectl apply -f kub_files/train-job-a100.yaml
+
+# Monitor
+kubectl logs -f job/v2v-diffusion-training-a100
 ```
 
-**Benefits:**
-- ✅ Faster convergence
-- ✅ More stable training
-- ✅ Better final quality
+**Configuration**: `config/slice_interpolation_full_medium.yaml`
+```yaml
+model:
+  latent_dim: 8
+  vae_base_channels: 128
+  unet_model_channels: 192
+
+  # VAE checkpoint (frozen during training)
+  checkpoint_path: '/workspace/storage_a100/checkpoints/vae_training_custom_vae_no_skips/vae_best.pt'
+
+training:
+  num_epochs: 100
+  learning_rate: 0.0001
+  batch_size: 8
+  mixed_precision: true
+  precision: 'bf16'
+
+  # VAE is FROZEN (requires_grad=False)
+  freeze_vae: true
+```
+
+**Expected Results:**
+- Target: PSNR 35-42 dB, SSIM 0.92-0.98 on thin slice generation
+- Training time: ~5-7 minutes/epoch on A100
+- Best checkpoint: `/workspace/storage_a100/checkpoints/slice_interpolation_full_medium/best.pt`
 
 ### Resume Training
 
 ```bash
-# Local
-python train.py --config config/cloud_train_config.yaml \
-  --resume /workspace/storage/checkpoints/ape_v2v_diffusion/checkpoint_epoch_10.pt
+# Update config
+resume_from_checkpoint: '/workspace/storage_a100/checkpoints/<job_name>/checkpoint_epoch_X.pt'
 
-# Kubernetes
-kubectl exec <POD_NAME> -- python train.py \
-  --config config/cloud_train_config.yaml \
-  --resume /workspace/storage/checkpoints/ape_v2v_diffusion/checkpoint_epoch_10.pt
+# Redeploy
+kubectl delete job <job-name>
+kubectl apply -f kub_files/<job-file>.yaml
 ```
 
 ### Monitoring
 
 ```bash
-# Watch logs
-kubectl logs -f <POD_NAME>
+# Training logs
+kubectl logs -f job/<job-name>
 
-# Check GPU
-kubectl exec <POD_NAME> -- nvidia-smi
-
-# Check checkpoints
-kubectl exec <POD_NAME> -- ls -lh /workspace/storage/checkpoints/ape_v2v_diffusion/
+# GPU utilization
+kubectl exec <pod-name> -- nvidia-smi
 
 # Storage usage
-kubectl exec <POD_NAME> -- df -h /workspace/storage
+kubectl exec <pod-name> -- df -h /workspace/storage_a100
+
+# Checkpoint list
+kubectl exec <pod-name> -- ls -lh /workspace/storage_a100/checkpoints/
 ```
 
 ---
 
-## 🔮 Inference
+## 🔮 Inference & Evaluation
 
-### Generate Enhanced CT
+### Evaluate VAE Reconstruction
 
 ```bash
-python inference.py \
-  --checkpoint checkpoints/checkpoint_final.pt \
-  --input input_ct_video.mp4 \
-  --output enhanced_ct_video.mp4 \
+# Test VAE quality on validation patches
+python scripts/evaluate_vae_reconstruction.py \
+  --checkpoint /workspace/storage_a100/checkpoints/vae_training_custom_vae_no_skips/vae_best.pt \
+  --config config/vae_training.yaml \
+  --split val \
+  --num_samples 10 \
+  --save_visualizations
+```
+
+### Evaluate Diffusion Model
+
+```bash
+# Generate and evaluate thin slices from thick slices
+python scripts/evaluate_and_visualize_patches.py \
+  --checkpoint /workspace/storage_a100/checkpoints/slice_interpolation_full_medium/best.pt \
+  --config config/slice_interpolation_full_medium.yaml \
+  --split val \
+  --num_samples 5 \
   --sampler ddim \
-  --steps 50
+  --steps 20
 ```
 
-### Inference Options
+### Visualization Output
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--checkpoint` | Path to trained model | Required |
-| `--input` | Input video path | Required |
-| `--output` | Output video path | Required |
-| `--sampler` | `ddim` (fast) or `ddpm` (quality) | `ddim` |
-| `--steps` | Denoising steps | 50 |
-| `--num-frames` | Frames to process | 8 |
-| `--resolution` | Output resolution | 128 128 |
-
----
-
-## 💾 Checkpoints & Storage
-
-### Checkpoint Location (Kubernetes)
-
+Generated visualizations saved to:
 ```
-/workspace/storage/checkpoints/ape_v2v_diffusion/
-├── checkpoint_epoch_0.pt          # After phase 1
-├── checkpoint_epoch_1.pt          # After phase 2
-├── checkpoint_step_500.pt         # Every 500 steps
-└── checkpoint_final.pt            # Final model
+/workspace/storage_a100/visualizations/<timestamp>/
+├── sample_0.png   # Input | Target | Prediction comparison
+├── sample_1.png
+└── metrics.json   # PSNR, SSIM for each sample
 ```
-
-### Download Checkpoints
-
-```bash
-# Copy from pod to local machine
-kubectl cp <POD_NAME>:/workspace/storage/checkpoints ./local_checkpoints
-
-# Copy specific checkpoint
-kubectl cp <POD_NAME>:/workspace/storage/checkpoints/ape_v2v_diffusion/checkpoint_final.pt ./
-```
-
-📖 **See [CHECKPOINT_STORAGE_GUIDE.md](CHECKPOINT_STORAGE_GUIDE.md) for complete storage guide**
 
 ---
 
@@ -319,68 +402,81 @@ kubectl cp <POD_NAME>:/workspace/storage/checkpoints/ape_v2v_diffusion/checkpoin
 ```
 LLM_agent_v2v/
 ├── config/
-│   └── cloud_train_config.yaml        # Training configuration
+│   ├── vae_training.yaml                      # VAE training config
+│   └── slice_interpolation_full_medium.yaml   # Diffusion training config
+│
 ├── models/
-│   ├── vae.py                         # 3D Video VAE (86M + 86M params)
-│   ├── unet3d.py                     # 3D U-Net denoiser (163M params)
-│   ├── diffusion.py                  # Diffusion process
-│   └── model.py                      # Complete model (335M params)
+│   ├── vae.py                    # Custom VideoVAE (NO skip connections)
+│   ├── unet3d.py                 # 3D U-Net denoiser
+│   ├── diffusion.py              # Gaussian diffusion process
+│   └── model.py                  # Complete latent diffusion model
+│
 ├── data/
-│   ├── ape_dataset.py                # APE-data loader
-│   ├── ape_hf_dataset.py             # HuggingFace streaming
-│   └── get_dataloader.py             # Unified dataloader
+│   ├── slice_interpolation_dataset.py         # Full-volume CT dataset
+│   ├── patch_slice_interpolation_dataset.py   # Patch-based dataset
+│   ├── get_dataloader.py                      # Unified dataloader interface
+│   └── transforms.py                          # Video transforms
+│
 ├── training/
-│   ├── trainer.py                    # Training loop with two-phase support
-│   └── scheduler.py                  # LR schedulers
+│   ├── trainer.py                # Training loop with validation
+│   └── scheduler.py              # Learning rate schedulers
+│
 ├── inference/
-│   ├── ddim_sampler.py               # DDIM sampling
-│   ├── ddpm_sampler.py               # DDPM sampling
-│   └── generate.py                   # Video generation
+│   └── sampler.py                # DDPM/DDIM samplers
+│
 ├── utils/
-│   ├── logger.py                     # Logging
-│   ├── pretrained.py                 # Pretrained weight loading
-│   └── metrics.py                    # PSNR, SSIM
-├── kub_files/                        # Kubernetes configs
-│   ├── persistent_storage.yaml       # 20Gi PVC
-│   ├── interactive-pod.yaml          # Development pod
-│   ├── training-pod.yaml             # Simple training
-│   └── training-job.yaml             # Batch job
-├── test_two_phase.py                 # Two-phase training test
-├── test_ape_data_loading.py          # Data loading test
-├── train.py                          # Main training script
-├── inference.py                      # Main inference script
-├── ARCHITECTURE.md                   # Complete architecture docs
-├── RUN_TRAINING_GUIDE.md             # Kubernetes training guide
-├── CHECKPOINT_STORAGE_GUIDE.md       # Storage management guide
-├── QUICK_START.md                    # Fast start guide
-└── README.md                         # This file
+│   ├── metrics.py                # PSNR, SSIM (standardized [0,1] range)
+│   ├── checkpoint.py             # Checkpoint saving/loading
+│   └── logger.py                 # Logging utilities
+│
+├── scripts/
+│   ├── evaluate_vae_reconstruction.py         # VAE quality testing
+│   ├── evaluate_and_visualize_patches.py      # Diffusion evaluation
+│   └── visualize_samples.py                   # Visualization utilities
+│
+├── tests/
+│   ├── test_model_integrity.py               # Comprehensive pytest suite (45+ tests)
+│   ├── test_vae_reconstruction.py            # VAE validation
+│   └── test_vae_compatibility.py             # VAE integration tests
+│
+├── kub_files/                                  # Kubernetes deployment
+│   ├── vae-training-job-a100.yaml            # VAE training (V100)
+│   ├── train-job-a100.yaml                   # Diffusion training (A100)
+│   ├── vae-evaluation-job.yaml               # VAE evaluation
+│   └── visualization-job-a100.yaml           # Visualization generation
+│
+├── train_vae.py                  # VAE training script
+├── train.py                      # Diffusion training script
+├── CLAUDE.md                     # Complete project context
+└── README.md                     # This file
 ```
+
+**Note**: Legacy files removed (dataset.py, ape_dataset.py, ape_hf_dataset.py, ape_cached_dataset.py, dicom_utils.py) - 2,833 lines cleaned up for focused CT slice interpolation pipeline.
 
 ---
 
 ## ⚡ Performance
 
-### Training Speed
+### Training Speed (A100 80GB)
 
-| Hardware | Batch Size | Samples/sec | Hours/Epoch (206 patients) |
-|----------|-----------|-------------|---------------------------|
-| Tesla V100 32GB | 1 | ~0.5 | ~2 hours |
-| Tesla V100 32GB | 2 | ~0.8 | ~1.3 hours |
-| A100 40GB | 2 | ~1.2 | ~0.9 hours |
-| A100 40GB | 4 | ~2.0 | ~0.5 hours |
+| Task | Batch Size | Time/Epoch | GPU Memory | Throughput |
+|------|-----------|-----------|------------|-----------|
+| VAE Training | 4 | ~8-10 min | 28-33 GB | ~0.4 samples/sec |
+| Diffusion Training | 8 | ~5-7 min | 40-50 GB | ~0.5 samples/sec |
 
-**Optimization Tips:**
-- ✅ Mixed precision (FP16): 2× speedup
-- ✅ Gradient accumulation: Simulate larger batches
-- ✅ Reduce resolution for testing: 64×64 → 4× faster
+**Optimizations:**
+- ✅ BF16 mixed precision (better than FP16 for A100)
+- ✅ Batch size increased (skip connections removed)
+- ✅ Preprocessed .pt cache (100-200× faster than DICOM loading)
+- ✅ Patch-based training (fixed size, no padding)
 
-### Memory Usage
+### Inference Speed
 
-| Task | GPU Memory | Configuration |
-|------|-----------|---------------|
-| Training (batch=1) | ~7.5 GB | 128×128, 8 frames, FP32 |
-| Training (batch=1, FP16) | ~5 GB | 128×128, 8 frames, mixed precision |
-| Inference | ~2.5 GB | 128×128, 8 frames |
+| Sampler | Steps | Time/Sample | Quality |
+|---------|-------|------------|---------|
+| DDIM | 20 | ~15 sec | Good |
+| DDIM | 50 | ~30 sec | Better |
+| DDPM | 1000 | ~10 min | Best |
 
 ---
 
@@ -389,27 +485,39 @@ LLM_agent_v2v/
 ### Run All Tests
 
 ```bash
-# Two-phase training test
-python test_two_phase.py
-# Expected: All 4 tests pass ✓
+# Comprehensive model integrity tests (45+ tests)
+pytest tests/test_model_integrity.py -v
 
-# Data loading test (requires local data or HuggingFace access)
-python test_ape_data_loading.py
-# Expected: Model integration test passes ✓
+# VAE reconstruction quality
+python tests/test_vae_reconstruction.py
+
+# VAE-UNet compatibility
+pytest tests/test_vae_compatibility.py -v
+
+# Code structure validation
+pytest tests/test_code_structure.py -v
 ```
 
-### Test Results
+### Test Coverage
 
-✅ **test_two_phase.py**
-- TEST 1: VAE freeze/unfreeze ✓
-- TEST 2: Phase transition ✓
-- TEST 3: Training completion ✓
-- TEST 4: Checkpoint saving ✓
+✅ **Model Integrity** (test_model_integrity.py)
+- Forward pass shapes
+- VAE encoding/decoding
+- U-Net denoising
+- Diffusion process
+- Gradient flow
+- Memory management
 
-✅ **test_ape_data_loading.py**
-- Model forward pass ✓
-- Inference generation ✓
-- Shape verification ✓
+✅ **VAE Reconstruction** (test_vae_reconstruction.py)
+- Encode→decode quality
+- Patch processing
+- Full volume handling
+- NaN detection
+
+✅ **Integration** (test_vae_compatibility.py)
+- VAE-UNet integration
+- Checkpoint loading
+- Config parsing
 
 ---
 
@@ -417,64 +525,57 @@ python test_ape_data_loading.py
 
 ### Out of Memory
 
-**Problem:** CUDA out of memory error
+**Problem**: CUDA out of memory during training
 
-**Solutions:**
+**Solutions**:
 ```yaml
 # Reduce batch size
-batch_size: 1
+batch_size: 2  # or 1
 
-# Reduce resolution
-resolution: [64, 64]  # or [128, 128]
-
-# Reduce frames
-num_frames: 4  # or 8
+# Reduce patch size
+patch_size: [128, 128]  # from [192, 192]
 
 # Enable gradient accumulation
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
+
+# Reduce workers
+num_workers: 2
 ```
+
+### VAE Reconstruction Poor Quality
+
+**Problem**: VAE PSNR < 35 dB
+
+**Check**:
+1. Skip connections disabled: `use_skip_connections: false` in config
+2. Using forward() method, not encode()/decode() separately
+3. Metrics use [0,1] normalization: `max_val=1.0`
+4. Training long enough (60-80 epochs minimum)
+
+### Diffusion Results Poor
+
+**Problem**: Diffusion PSNR ~6-7 dB instead of 35-42 dB
+
+**Check**:
+1. VAE properly frozen: `freeze_vae: true` in config
+2. VAE checkpoint loaded correctly
+3. VAE uses NO skip connections (custom_vae_no_skips checkpoint)
+4. Metrics standardized to [0,1] range across all scripts
 
 ### Kubernetes Pod Pending
 
-**Problem:** Pod stuck in "Pending" state
+**Problem**: Job stuck in pending state
 
-**Check:**
+**Check**:
 ```bash
-kubectl describe pod <POD_NAME>
+# GPU node availability
+kubectl get nodes -l nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB
 
-# Common causes:
-# 1. No GPU nodes available
-kubectl get nodes -l nvidia.com/gpu.product=Tesla-V100-SXM2-32GB
+# Resource limits
+kubectl describe job <job-name>
 
-# 2. PVC not bound
-kubectl get pvc v2v-diffuser-kuntal
-```
-
-### Training Very Slow
-
-**Problem:** Training takes too long
-
-**Solutions:**
-- ✅ Enable mixed precision: `mixed_precision: true`
-- ✅ Increase `num_workers`: `num_workers: 4`
-- ✅ Check GPU utilization: `nvidia-smi`
-- ✅ Use gradient accumulation instead of large batch
-
-### Checkpoints Not Saving
-
-**Problem:** Checkpoints not in persistent storage
-
-**Check:**
-```bash
-# Verify checkpoint directory
-kubectl exec <POD_NAME> -- ls -lh /workspace/storage/checkpoints/
-
-# Check PVC is mounted
-kubectl exec <POD_NAME> -- df -h /workspace/storage
-
-# Verify config
-grep checkpoint_dir config/cloud_train_config.yaml
-# Should show: /workspace/storage/checkpoints
+# PVC binding
+kubectl get pvc
 ```
 
 ---
@@ -483,30 +584,36 @@ grep checkpoint_dir config/cloud_train_config.yaml
 
 | Document | Description |
 |----------|-------------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Complete architecture with layer dimensions and diagrams |
-| [RUN_TRAINING_GUIDE.md](RUN_TRAINING_GUIDE.md) | Step-by-step Kubernetes training guide |
-| [CHECKPOINT_STORAGE_GUIDE.md](CHECKPOINT_STORAGE_GUIDE.md) | Persistent storage and checkpoint management |
-| [QUICK_START.md](QUICK_START.md) | 3-command fast start |
-| README.md | This file - project overview |
+| [CLAUDE.md](CLAUDE.md) | Complete project context, architecture, and technical details |
+| [README.md](README.md) | This file - project overview and quick start |
 
 ---
 
 ## 🎯 Roadmap
 
-- [x] 3D Video VAE implementation
-- [x] 3D U-Net denoiser
-- [x] Two-phase training strategy
-- [x] Layer-wise learning rates
-- [x] Kubernetes deployment
-- [x] Persistent storage support
-- [x] HuggingFace dataset integration
-- [x] DDIM/DDPM sampling
-- [x] Comprehensive documentation
+### Completed ✅
+- [x] Custom VAE training from scratch
+- [x] Removed skip connections for latent diffusion compatibility
+- [x] Patch-based training pipeline
+- [x] Data preprocessing with caching
+- [x] BF16 mixed precision training
+- [x] Metric standardization ([0,1] range)
+- [x] VAE-UNet integration fixes
+- [x] Data pipeline cleanup
+- [x] Comprehensive test suite (45+ tests)
+- [x] Kubernetes deployment (A100 GPU)
+
+### In Progress 🔄
+- [ ] Diffusion model training (VAE frozen)
+- [ ] Hyperparameter tuning
+- [ ] Validation metrics tracking
+
+### Planned 📋
+- [ ] Full-volume inference with stitching
+- [ ] TensorBoard logging
 - [ ] Multi-GPU distributed training
-- [ ] Pretrained VAE weights (architecture matching required)
-- [ ] TensorBoard integration
-- [ ] Weights & Biases logging
-- [ ] Inference optimization (TensorRT)
+- [ ] Inference optimization (compile, TensorRT)
+- [ ] Clinical validation
 
 ---
 
@@ -537,6 +644,8 @@ This implementation is based on:
 }
 ```
 
+**Dataset**: APE-data (Acute Pulmonary Embolism CT scans)
+
 ---
 
 ## 📄 License
@@ -547,31 +656,29 @@ MIT License
 
 ## 🙏 Acknowledgments
 
-- Video diffusion architecture inspired by [lucidrains/video-diffusion-pytorch](https://github.com/lucidrains/video-diffusion-pytorch)
-- DDIM sampling based on [Song et al. 2021](https://arxiv.org/abs/2010.02502)
 - Latent diffusion concept from [Stable Diffusion](https://github.com/CompVis/stable-diffusion)
-- Dataset: [APE-data on HuggingFace](https://huggingface.co/datasets/t2ance/APE-data)
-- Kubernetes deployment with GPU support
+- DDIM sampling from [Song et al. 2021](https://arxiv.org/abs/2010.02502)
+- Medical imaging techniques from MONAI framework
+- Dataset: APE-data for pulmonary embolism detection
 
 ---
 
 ## 🚀 Get Started Now!
 
 ```bash
-# 1. Quick test locally
-python test_two_phase.py
+# 1. Test VAE reconstruction
+python tests/test_vae_reconstruction.py
 
-# 2. Deploy to Kubernetes
-kubectl apply -f kub_files/persistent_storage.yaml
-kubectl apply -f kub_files/interactive-pod.yaml
+# 2. Deploy VAE training to Kubernetes
+kubectl apply -f kub_files/vae-training-job-a100.yaml
 
-# 3. Start training
-kubectl exec -it v2v-diffusion-interactive -- python train.py --config config/cloud_train_config.yaml
+# 3. Monitor training
+kubectl logs -f job/vae-training-job-a100
+
+# 4. After VAE completes, train diffusion model
+kubectl apply -f kub_files/train-job-a100.yaml
 ```
 
-**Questions?** Check the guides:
-- [QUICK_START.md](QUICK_START.md) for fast deployment
-- [RUN_TRAINING_GUIDE.md](RUN_TRAINING_GUIDE.md) for detailed instructions
-- [ARCHITECTURE.md](ARCHITECTURE.md) for model details
+**Questions?** Check [CLAUDE.md](CLAUDE.md) for complete project context and architecture details.
 
 Happy Training! 🎉

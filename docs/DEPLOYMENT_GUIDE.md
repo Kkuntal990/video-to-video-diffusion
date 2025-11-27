@@ -135,7 +135,7 @@ print(f'Sample keys: {sample.keys()}')
 
 ```bash
 # Inside the pod, try running training for a few steps
-python train.py --config config/cloud_train_config.yaml
+cd /workspace && python -m training.train --config config/cloud_train_config.yaml
 ```
 
 **Note**: Monitor the output for any errors. Press Ctrl+C after confirming it starts successfully.
